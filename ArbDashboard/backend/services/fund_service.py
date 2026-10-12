@@ -642,6 +642,9 @@ def _get_ag0_future_quote():
                 sina_settle = float(parts[10]) if parts[10] else 0.0
                 sina_bid = float(parts[6]) if len(parts) > 6 and parts[6] else 0.0
                 sina_ask = float(parts[7]) if len(parts) > 7 and parts[7] else 0.0
+                # [AI-2026-10-12] 补提取 parts[9] 动态结算均价(VWAP)，与 _get_m0_future_quote 对称；
+                # 原漏提取致东财SSE不可用时 quote 无 vwap，详情弹窗「当日VWAP」显示 '-'
+                sina_vwap = float(parts[9]) if len(parts) > 9 and parts[9] else 0.0
                 if not quote:
                     quote = {'price': sina_price, 'source': '新浪'}
                 # 用新浪覆盖 bid/ask（更准），保留东财的结算价
@@ -651,6 +654,8 @@ def _get_ag0_future_quote():
                     quote['ask'] = sina_ask
                 if sina_settle > 0:
                     quote['settlement'] = sina_settle
+                if sina_vwap > 0:
+                    quote['vwap'] = sina_vwap
                 quote['source'] = '东财SSE+新浪'
     except Exception:
         pass
@@ -697,6 +702,15 @@ def _futures_session_open(symbol: str) -> bool:
     except Exception:
         pass
     return False
+
+
+def _in_day_session_window() -> bool:
+    """[AI-2026-10-12 东哥要求] A股日盘时段窗口判定（含午休 11:30-13:30、小节休息 10:15-10:30）。
+    交易日 9:00-15:00 之间，即使 is_shfe_open/is_dce_open 返回 False（休市间隙），
+    新浪 nf_AG0/nf_M0 返回的仍是当日上一节的真实收盘/VWAP（非陈旧隔夜值）→
+    不丢弃，让主看板显示上午数据。15:00 后/周末/节假日返回 False，走原有盘后官方收盘分支。"""
+    _now = datetime.now()
+    return _now.weekday() < 5 and (9, 0) <= (_now.hour, _now.minute) < (15, 0)
 
 
 def _get_futures_official_price(conn, symbol: str, today: str, column: str = 'close_price'):
@@ -2014,7 +2028,11 @@ class FundService:
                         # 避免陈旧实时价/午间 VWAP 被当实时展示；但**保留"昨结算价"(settlement_price)**——
                         # 昨结算价 = 上一交易日官方结算，跨交易时段恒定不变，东哥要求主看板始终展示。
                         # （rt_val 依赖实时成交价、static_val/si_val 依赖 VWAP，休市时仍留空，符合设计）
-                        if not _ag_session_open:
+                        # [AI-2026-10-12 东哥拍板] 日盘 9:00-15:00 内的间隙（午休/小节休息）不丢弃：
+                        # 此时新浪 nf_AG0 返回的是当日上一节真实收盘/VWAP（非隔夜陈旧值），主看板
+                        # 应显示上午数据；15:00 后仍丢弃走盘后官方收盘分支（futures_daily 16:36 前
+                        # 显 '-' 等待数据，无兜底）。
+                        if not _ag_session_open and not _in_day_session_window():
                             logger.debug(f"[{code}] SHFE 当前休市，丢弃 AG0 实时成交价/VWAP(最新价={ag_future_price}/VWAP={vwap})，"
                                          f"保留昨结算价={settlement_price}")
                             ag_future_price, vwap = 0.0, 0.0
@@ -2155,7 +2173,10 @@ class FundService:
                             except Exception as _e:
                                 logger.debug(f"[159985] M0 昨结算 DB 备用源读取失败: {_e}")
                         # 休市时段：丢弃实时成交价/VWAP，保留昨结算价
-                        if not _m_session_open and m_settlement > 0:
+                        # [AI-2026-10-12 东哥拍板] 日盘 9:00-15:00 内间隙（午休/小节休息）不丢弃：
+                        # 新浪 nf_M0 返回当日上一节真实收盘/VWAP（非隔夜陈旧值），主看板显示上午数据；
+                        # 15:00 后仍丢弃走盘后官方收盘分支（futures_daily 16:36 前显 '-' 等待数据）。
+                        if not _m_session_open and not _in_day_session_window() and m_settlement > 0:
                             m_future_price, m_vwap = 0.0, 0.0
                         nav_home = float(metrics.get('nav', 0))
                         if m_settlement > 0:
@@ -2172,7 +2193,9 @@ class FundService:
                         # [AI-2026-10-11 东哥报缺] 仅在 M0 交易时段内覆盖 static_val：休市时 m_vwap 已被
                         #   上方守卫置 0，若仍走 else→None 会把库里 step12 写好的官方结算估值清空
                         #   ——豆粕「官方估值」整夜/周末恒显示 '-' 的根因。对齐 161226：休市不覆盖。
-                        if _m_session_open:
+                        # [AI-2026-10-12 东哥拍板] 日盘内间隙（午休）m_vwap 已保留上午真实 VWAP，
+                        #   同样进入覆盖（m_vwap>0 守卫防 sina 缺数据时 else→None 误清官方估值，10-11 修复不回归）。
+                        if _m_session_open or (_in_day_session_window() and m_vwap > 0):
                             if m_vwap > 0 and m_settlement > 0 and nav_home > 0:
                                 metrics['static_val'] = round(nav_home * (m_vwap / m_settlement), 4)
                                 # [AI-2026-10-11 东哥要求] 「当日VWAP(结算价)」列：盘中=VWAP动态结算均价

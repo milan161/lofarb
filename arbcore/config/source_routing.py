@@ -38,6 +38,14 @@ def get_symbol_source(symbol, use_ib=True):
             if src == 'IB' and (not use_ib and cand in US_ETF_MAP or (base not in IB_CORE_ARBITRAGE_SYMBOLS and cand not in IB_CORE_ARBITRAGE_SYMBOLS)):
                 return 'FUTU'
             return src
+    # [AI-2026-10-12 东哥拍板] 6位纯数字 = A股上市 LOF/ETF 代码（权威源=DB unified_fund_list，
+    # YAML symbol_sources 只是路由加速表，不是准入名单）。未声明时不再抛 KeyError，直接路由
+    # TDX —— market_data_service 对 TDX 落 RealtimeMarketManager 回退链（tdx→guojin→galaxy→sina→tencent），
+    # historical/manager 对 TDX 走 sina 历史，均为正确 A 股通道。曾因 159513/513650/159660 等
+    # 新增基金未同步 YAML 导致主看板每轮刷新刷屏 KeyError（fund_service 1858 捕获）。
+    # 非6位数字的未知 symbol（znb_*/HSCHK25 等合成/指数符号）仍显式报错，保留防静默错配设计。
+    if base.isdigit() and len(base) == 6:
+        return 'TDX'
     raise KeyError(f"symbol '{s}' 未在 lof_config.yaml 的 symbol_sources 声明，无法路由。请先在 YAML 添加该 symbol 的数据源。")
 
 

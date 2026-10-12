@@ -50,22 +50,35 @@ class DynamicValuationCalculator:
             category = category_fx  # 复用
 
             # ── 第一步：独立取各数据源最新值 ──────────────────────────────
-            # fund_daily_factors：position/hedge/calibration 数天不变，独立取最新
+            # [AI-2026-10-12 东哥拍板·撤woody] position 改读 unified_fund_list.pos_ratio
+            #   （DB 绝对权威，AGENTS 铁律15；woody 对 QDII日本停更后 pos_ratio 为稳定硬编码值，
+            #    东哥明确授权"不依赖woody，静态路径用pos_ratio，可接受硬编码"）。
+            #   原读 fund_daily_factors.position（woody写入），撤woody后会冻结成陈旧值，
+            #   改读 pos_ratio 后与主面板实时分支(fund_service L1912/L1938)口径完全一致。
+            pos_df = pd.read_sql(
+                "SELECT pos_ratio FROM unified_fund_list WHERE fund_code = ?",
+                conn, params=(fund_code,)
+            )
+            _pos_ratio = None
+            if not pos_df.empty and pd.notna(pos_df.iloc[0]['pos_ratio']):
+                _pos_ratio = float(pos_df.iloc[0]['pos_ratio'])
+
+            # hedge/calibration 仍从 fund_daily_factors 取最新（QDII日本撤woody后为None，不兜底）
             factor_df = pd.read_sql(
-                "SELECT date, position, hedge, calibration FROM fund_daily_factors "
-                "WHERE fund_code = ? AND position IS NOT NULL AND position > 0 "
+                "SELECT date, hedge, calibration FROM fund_daily_factors "
+                "WHERE fund_code = ? AND hedge IS NOT NULL "
                 "ORDER BY date DESC LIMIT 1",
                 conn, params=(fund_code,)
             )
             if not factor_df.empty:
                 fr = factor_df.iloc[0]
                 base_row: Dict[str, Any] = {
-                    'position': fr['position'],
+                    'position': _pos_ratio,
                     'hedge': fr['hedge'],
                     'calibration': fr['calibration'],
                 }
             else:
-                base_row = {'position': None, 'hedge': None, 'calibration': None}
+                base_row = {'position': _pos_ratio, 'hedge': None, 'calibration': None}
 
             # unified_fund_history：nav/close 每天更新，独立取最新
             # [AI-2026-08-21] 修复：只取 nav IS NOT NULL 的行，避免取到盘中空行导致 calculate() 返回 None

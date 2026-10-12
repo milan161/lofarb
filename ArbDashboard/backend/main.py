@@ -600,7 +600,9 @@ async def lifespan(app: FastAPI):
             while True:
                 await asyncio.sleep(300)
                 now = datetime.now()
-                if now.weekday() in (5, 6):
+                # [AI-2026-10-12 东哥拍板] 仅周日跳过，周六放行——VPS crontab 每天跑，
+                # 周五美股数据必须周六清晨收（daily_updater 门控会走 _weekend_vps_pull_only）。
+                if now.weekday() == 6:
                     _morning_refreshed_today = False
                     continue
                 today = now.strftime("%Y-%m-%d")

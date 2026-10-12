@@ -2501,6 +2501,22 @@ symbol_sources:
   PSI: FUTU
   SOXQ: FUTU
   2644.T: FUTU
+  # [AI-2026-10-12] 补齐 DB unified_fund_list 有而 YAML 缺失的 14 只 QDII欧美 ETF（东哥拍板同步）
+  # 全部为 A 股上市跨境 ETF，走 TDX（RealtimeMarketManager 回退链 tdx→guojin→galaxy→sina→tencent）
+  '159501': TDX
+  '159513': TDX
+  '159612': TDX
+  '159632': TDX
+  '159655': TDX
+  '159659': TDX
+  '159660': TDX
+  '159696': TDX
+  '159941': TDX
+  '513110': TDX
+  '513300': TDX
+  '513390': TDX
+  '513650': TDX
+  '513870': TDX
 ib_core_symbols:
 - XOP
 - GLD

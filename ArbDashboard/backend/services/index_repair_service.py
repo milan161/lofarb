@@ -335,8 +335,12 @@ def _fetch_sina_global_index(symbol: str, days: int = 30) -> list:
 
     # 1. 尝试新浪 US_MinKService 日线 API（美股日线接口，部分海外指数也可用）
     try:
-        # N225 在新浪 US 接口中可能的 symbol 格式
-        alt_symbols = ['n225', 'nikkei', '^n225']
+        # [AI-2026-10-12] 按指数符号选择候选：N225 用 nikkei 系，TOPIX 用 topix 系
+        if 'TOPIX' in symbol.upper() or symbol.upper() == 'TPX':
+            alt_symbols = ['topix', 'tpx', '^topix', 'int_topix']
+        else:
+            # N225 在新浪 US 接口中可能的 symbol 格式
+            alt_symbols = ['n225', 'nikkei', '^n225']
         for alt_sym in alt_symbols:
             url = f"https://stock.finance.sina.com.cn/usstock/api/json_v2.php/US_MinKService.getDailyK?symbol={alt_sym}"
             resp = requests.get(url, headers={
@@ -551,7 +555,7 @@ def repair_fund_index_history(fund_code: str, days_back: int = 30) -> dict:
         cat = 'a_share_sh'
     elif clean in HK_INDICES:
         cat = 'hk'
-    elif clean.startswith('N225') or 'NK' in clean:
+    elif clean.startswith('N225') or 'NK' in clean or 'TOPIX' in clean or clean == 'TPX':
         cat = 'jp_index'
 
     if cat is None or cat == 'skip':

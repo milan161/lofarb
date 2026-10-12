@@ -209,17 +209,25 @@ class DailyUpdater(BaseApp):
             for remote_file in sorted(target_files):
                 # 从文件名提取日期 (woody_2026-05-31.json -> 2026-05-31)
                 # [AI-2026-07-20] 修复：不能用 split('_')[1]（etf_nav_*.json 前缀有下划线会解析为'nav'）
-                try:
-                    file_date = remote_file[len(data_type)+1:].replace('.json', '')
-                except Exception:
+                # [AI-2026-10-12] 修复：index_<SYM>_<date>.json（如 index_CAC_2026-10-08.json）被旧逻辑
+                #   解析成 file_date="CAC_2026-10-08"，step5b 内 strptime(file_date) 崩溃、
+                #   CAC/DAX/HSCEI 指数数据被丢弃。改用正则从文件名提取 YYYY-MM-DD 日期段。
+                _m = re.search(r'(\d{4}-\d{2}-\d{2})', remote_file)
+                if not _m:
+                    self.logger.warning(f"[VPS] 无法从文件名提取日期，跳过: {remote_file}")
                     continue
+                file_date = _m.group(1)
+                # 同步标记键：保留完整文件名 stem（含符号），避免同日多指数文件互相覆盖标记
+                #   index_CAC_2026-10-08.json → "CAC_2026-10-08"（与旧标记键一致，无迁移问题）
+                #   woody_2026-05-31.json → "2026-05-31"（与旧行为一致）
+                sync_marker_key = remote_file[len(data_type)+1:].replace('.json', '')
 
                 local_path = os.path.join(local_sync_dir, remote_file)
-                
+
                 # [性能优化] 如果数据库已经同步过该日期，直接跳过（不依赖本地缓存文件，修复本地缓存被删除后重复下载的bug）
                 sync_key = f"{data_type}_vps_sync"
                 # [AI-2026-07-06] 移除 os.path.exists 要求：只要 access_sync_status 有标记就跳过，即使缓存文件被删除
-                if self.db.is_access_synced_today(file_date, sync_key):
+                if self.db.is_access_synced_today(sync_marker_key, sync_key):
                     continue
 
                 # 3. 增量同步：如果本地不存在，则下载
@@ -227,14 +235,14 @@ class DailyUpdater(BaseApp):
                     remote_path = f"{VPS_DATA_DIR}/{remote_file}"
                     self.logger.info(f"[VPS] 正在补全历史数据: {remote_file}")
                     sftp.get(remote_path, local_path)
-                
+
                 # 4. 加载数据 (无论是刚下载的还是本地已有的)
                 try:
                     with open(local_path, 'r', encoding='utf-8') as f:
                         content = json.load(f)
                     synced_data_list.append({'date': file_date, 'content': content})
                     # [AI-2026-07-03] 标记VPS文件已读取解析，下次跳过检查能找到此标记，避免重复加载
-                    self.db.mark_access_synced(file_date, f"{data_type}_vps_sync")
+                    self.db.mark_access_synced(sync_marker_key, f"{data_type}_vps_sync")
                 except Exception as e:
                     self.logger.error(f"[VPS] 解析本地同步文件失败 {remote_file}: {e}")
 
@@ -361,12 +369,24 @@ class DailyUpdater(BaseApp):
         today_str = datetime.now().strftime('%Y-%m-%d')
         sync_key = "woody_lof_batch"
         
-        # 🛡️ 总闸检查：如果今日已经处理过（无论是通过 VPS 还是 API），直接跳过整个步骤
+        # 🛡️ 总闸检查：今日已处理过（任一通道成功）→ 跳过整步
         if self.db.is_access_synced_today(today_str, sync_key):
             self.logger.info(f"✅ 今日 Woody 因子已处理完毕（防刷标记 {sync_key} 已存在），跳过 VPS 同步与 API 请求。")
             return True
 
-        # 🛡️ 数据库检查：如果库里已有今天的 Woody 因子数据，无需连 VPS
+        # 🛡️ [AI-2026-10-12 东哥定调 · 修 Q1「双闸」bug] 「今日数据是否已定型」必须问**来源**，
+        #   而不是问「库里有没有今日任何原始数据」。旧判据（raw_api_data 存在且是合法 JSON）的致命缺陷：
+        #   凌晨流水线跑在 VPS 09:20 产出之前 ⇒ 回落 Level 1「直连 woody API」并写下当日 raw 行 ⇒
+        #   09:20 的 `--refresh-morning` 虽然清了 woody_lof_batch 防刷标记，仍被这道 DB 闸短路
+        #   ⇒ **东京 VPS 09:20 的权威文件永远拉不到**（10-12 实证，细节见 memory/2026-10-12.md §一）。
+        #   新判据：只有「已由 VPS 通道入库」（woody_vps_ingested）才算定型；非 VPS 来源的当日数据
+        #   **不阻止**后续 VPS 覆盖（save_raw_api_data 是 INSERT OR REPLACE，process() 会重写各因子表）。
+        if self.db.is_access_synced_today(today_str, 'woody_vps_ingested'):
+            self.logger.info(f"✅ 今日({today_str}) Woody 因子已由 VPS 通道入库，跳过。")
+            self.db.mark_access_synced(today_str, sync_key)
+            return True
+
+        # 🛡️ 保留旧安全网：库里有今日原始数据但内容无效（如 "未授权IP" 错误串）⇒ 清除后重取
         try:
             conn = self.db._get_conn()
             cursor = conn.execute(
@@ -377,17 +397,16 @@ class DailyUpdater(BaseApp):
             count = row[0] if row else 0
             raw_content = row[1] if row else ""
             conn.close()
-            # 只有内容是有效 JSON dict 时才认为已入库（排除错误信息如 "未授权IP"）
-            if count > 0 and raw_content and raw_content.strip().startswith('{'):
-                self.logger.info(f"✅ 今日({today_str}) Woody 原始数据已在库中({count}条)，无需连VPS，直接标记完成。")
-                self.db.mark_access_synced(today_str, sync_key)
-                return True
-            elif count > 0:
+            if count > 0 and not (raw_content and raw_content.strip().startswith('{')):
                 self.logger.warning(f"⚠️ 今日({today_str}) Woody 原始数据在库中但内容无效（非JSON），清除后重新获取...")
                 conn2 = self.db._get_conn()
                 conn2.execute("DELETE FROM raw_api_data WHERE date = ? AND source = 'woody_lof'", (today_str,))
                 conn2.commit()
                 conn2.close()
+            elif count > 0:
+                self.logger.info(
+                    f"ℹ️ 今日({today_str}) 库内有 Woody 原始数据但非 VPS 来源（可能为凌晨直连 API 抢跑），"
+                    f"继续走 VPS 同步，让权威文件覆盖它。")
         except Exception as e:
             self.logger.warning(f"检查 Woody 数据库时出错: {e}，继续连接VPS获取")
 
@@ -431,35 +450,21 @@ class DailyUpdater(BaseApp):
                 file_date = item['date']
                 content = item['content']
 
-                # 🛡️ [AI-2026-07-06] 检查本地 raw_api_data 是否已有该日期的因子数据
-                # 解决 access_sync_status 被清理后 VPS 重复处理历史数据的 bug
-                # [AI-2026-07-25] 修复：如果 raw 存在但 fund_daily_factors 缺失，说明之前只存了原始数据没解析，需补解析
-                existing_raw = self.db.get_raw_api_data(file_date, 'woody_lof')
-                if existing_raw:
-                    # 检查是否已解析入库
-                    try:
-                        _c = self.db._get_conn()
-                        factor_count = _c.execute(
-                            "SELECT COUNT(*) FROM fund_daily_factors WHERE date=?",
-                            (file_date,)
-                        ).fetchone()[0]
-                        _c.close()
-                    except Exception:
-                        factor_count = 0
-                    if factor_count > 0:
-                        self.logger.info(f"   ⏭️ [VPS] 日期 {file_date} 的因子原始数据已存在且已解析，跳过")
-                        self.db.mark_access_synced(file_date, 'woody_vps_sync')
-                        if file_date == today_str:
-                            vps_today_success = True
-                        continue
-                    else:
-                        self.logger.info(f"   🔧 [VPS] 日期 {file_date} 有原始数据但未解析，正在补解析...")
+                # 🛡️ [AI-2026-10-12 修 Q1 双闸] 判据改为「该日是否**已由 VPS 入库**」（woody_vps_ingested）。
+                #   旧判据用 fund_daily_factors 是否有行 ⇒ 会把凌晨 Level 1 直连 API 抢跑写下的当日数据
+                #   当成「已解析」而跳过 VPS 文件 ⇒ 权威数据进不来。现在非 VPS 来源的当日行会被 VPS 覆盖重解析。
+                #   （注：woody_vps_sync 只表示「文件已下载/已读取」，故不能拿它当入库判据。）
+                if self.db.is_access_synced_today(file_date, 'woody_vps_ingested'):
+                    self.logger.info(f"   ⏭️ [VPS] 日期 {file_date} 已由 VPS 入库，跳过")
+                    if file_date == today_str:
+                        vps_today_success = True
+                    continue
 
                 try:
                     # 提取真实内容 (Woody API 包装在 text 字段里)
                     api_content = content.get('text') if isinstance(content, dict) else content
                     if api_content:
-                        # 1. 存入本地原始数据湖 (Data Lake)
+                        # 1. 存入本地原始数据湖 (Data Lake)（INSERT OR REPLACE，可覆盖非 VPS 来源的当日行）
                         raw_json_str = json.dumps(api_content, ensure_ascii=False, indent=2)
                         self.db.save_raw_api_data(date=file_date, source='woody_lof', raw_content=raw_json_str)
                         
@@ -470,6 +475,7 @@ class DailyUpdater(BaseApp):
                             # [性能优化] 标记该日期已处理，下次不再重复解析
                             self.db.mark_access_synced(file_date, sync_key)
                             self.db.mark_access_synced(file_date, 'woody_vps_sync')
+                            self.db.mark_access_synced(file_date, 'woody_vps_ingested')  # ← 来源标记（权威通道）
                             if file_date == today_str:
                                 vps_today_success = True
                 except Exception as e:
@@ -2621,9 +2627,15 @@ class DailyUpdater(BaseApp):
             self.logger.warning(f"[交易日门控] A股日历不可用({_e_td})，退回周末判断")
             _is_cn_td = now.weekday() < 5
         if not _is_cn_td and os.environ.get('ARB_WEEKEND_PIPELINE', '0') != '1':
+            # [AI-2026-10-12 东哥拍板] 非交易日不再"直接停跑"，改为轻量补拉后停跑：
+            #   东哥定"周末也需要爬数据"—— VPS crontab 每天跑（docs/002_1:46 `* * *`），
+            #   周五美股数据必须周六清晨收（etf_nav due：昨日=周五美交易日）。
+            #   此前门控直接 return，导致周六 VPS 文件从未被本机拉取 → XOP 等 QDII 周五净值
+            #   一直缺到下周一。现改为：非交易日执行 _weekend_vps_pull_only()（step5+5b+5c+静态重算）再返回。
             self.logger.info(
-                f"📅 [{now.strftime('%Y-%m-%d')}] 非A股交易日 → 停跑（周末/假期停采）。"
-                f"如需强制运行：设 ARB_WEEKEND_PIPELINE=1 后重启。")
+                f"📅 [{now.strftime('%Y-%m-%d')}] 非A股交易日 → 轻量补拉（step5美股+5b指数+5c净值+静态重算）后停跑。"
+                f"如需强制全量运行：设 ARB_WEEKEND_PIPELINE=1 后重启。")
+            self._weekend_vps_pull_only()
             return
 
         if daily_close:
@@ -2652,7 +2664,12 @@ class DailyUpdater(BaseApp):
             if now.weekday() in (5, 6):
                 self.logger.info("📅 周末跳过。")
                 return
-            for src in ['woody_lof_batch', 'official_exchange_rate', 'futures_data', 'jsl_shares_data']:
+            # [AI-2026-10-12 修 Q1 双闸] 必须连「VPS 来源标记」一起清 —— 否则 09:20 的权威文件
+            #   ① 被 step1 的 VPS 来源闸 (woody_vps_ingested) 判定为「已入库」而跳过；
+            #   ② 被 _try_sync_all_from_vps 的 per-file 标记 (woody_vps_sync) 挡在门外（连文件都不加载）。
+            #   三个一起清，本次刷新才会真正重取 VPS 文件并用它覆盖凌晨直连 API 抢跑的数据。
+            for src in ['woody_lof_batch', 'woody_vps_sync', 'woody_vps_ingested',
+                        'official_exchange_rate', 'futures_data', 'jsl_shares_data']:
                 self.logger.info(f"🗑️ 清除 {src} 标记")
                 self.db.remove_access_sync_status(today_str, src)
             self._run_pipeline()
@@ -2719,6 +2736,26 @@ class DailyUpdater(BaseApp):
         self.step12_futures_static_valuation(recent_days=5)
         self.step13_oil_data_sync()
         self.logger.info("🎉 流水线执行完毕，数据大盘一切就绪！")
+
+    def _weekend_vps_pull_only(self):
+        """[AI-2026-10-12 东哥拍板] 非交易日（周六为主）轻量补拉 step5b+step5c，不跑完整流水线。
+
+        动机：VPS crontab 每天跑（`* * *`，docs/002_1:46），周五美股数据必须**周六清晨**收。
+        此前门控直接 return，周六从未拉 VPS → XOP 等 QDII 周五净值一直缺到下周一。
+
+        due 判定（_try_sync_all_from_vps 内部按 file_date 幂等）：
+          - step5c etf_nav：昨日=周五美交易日 → 周六 due，补拉周五净值 ✓
+          - step5b index：周六非日/欧交易日 → 不 due（no-op），但周五欧/日指数仍会补到 ✓
+        每步独立 try/except，单步失败（VPS 不可达等）不中断；重复跑安全（幂等）。
+        """
+        self.logger.info("🛰️ [周末轻量补拉] step5b(指数) + step5c(ETF净值)...")
+        for name, fn in (("step5b", self.step5b_sync_vps_index_data),
+                         ("step5c", self.step5c_sync_vps_etf_nav)):
+            try:
+                fn()
+            except Exception as _e:
+                self.logger.warning(f"⚠️ [周末轻量补拉] {name} 失败（不中断）: {_e}")
+        self.logger.info("🎉 [周末轻量补拉] 完成")
 
     def step13_oil_data_sync(self):
         """[AI-2026-09-23 B方案] 原油三基金数据同步（替代旧 step13_sync_oil_to_arm）。
