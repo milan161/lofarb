@@ -523,6 +523,11 @@ class SSEFuturesReader:
         self.ag0_price = 0.0
         self.ag0_settlement = 0.0
         self.ag0_vwap = 0.0
+        # [AI-2026-10-15] 豆粕 M0（大商所）属性：结构对齐 ag0。东财 SSE 仅订阅沪银(113_agm_qt)，
+        # DCE 无对应 SSE 通道，故 m0_* 恒为 0；接入大商所 SSE 后此优先级自动生效，无需改 m0 块逻辑。
+        self.m0_price = 0.0
+        self.m0_settlement = 0.0
+        self.m0_vwap = 0.0
         self.running = False
         self._thread = None
 
@@ -642,9 +647,10 @@ def _get_ag0_future_quote():
                 sina_settle = float(parts[10]) if parts[10] else 0.0
                 sina_bid = float(parts[6]) if len(parts) > 6 and parts[6] else 0.0
                 sina_ask = float(parts[7]) if len(parts) > 7 and parts[7] else 0.0
-                # [AI-2026-10-12] 补提取 parts[9] 动态结算均价(VWAP)，与 _get_m0_future_quote 对称；
+                # [AI-2026-10-12] 补提取动态结算均价(VWAP)，与 _get_m0_future_quote 对称；
                 # 原漏提取致东财SSE不可用时 quote 无 vwap，详情弹窗「当日VWAP」显示 '-'
-                sina_vwap = float(parts[9]) if len(parts) > 9 and parts[9] else 0.0
+                # [AI-2026-10-15 FIX] parts[9] 恒为 0、parts[28] 漂移——改用稳健扫描提取
+                sina_vwap = _extract_sina_vwap(parts)
                 if not quote:
                     quote = {'price': sina_price, 'source': '新浪'}
                 # 用新浪覆盖 bid/ask（更准），保留东财的结算价
@@ -683,12 +689,47 @@ def _get_m0_future_quote():
                     'bid': float(parts[6]) if len(parts) > 6 and parts[6] else 0.0,
                     'ask': float(parts[7]) if len(parts) > 7 and parts[7] else 0.0,
                     'settlement': float(parts[10]) if parts[10] else 0.0,
-                    'vwap': float(parts[9]) if len(parts) > 9 and parts[9] else 0.0,
+                    # [AI-2026-10-15 FIX] parts[9] 恒为 0、parts[28] 漂移——改用稳健扫描提取均价
+                    'vwap': _extract_sina_vwap(parts),
                     'source': '新浪',
                 }
     except Exception:
         pass
     return quote
+
+
+def _extract_sina_vwap(parts, latest_idx=8, high_idx=3, low_idx=4):
+    """[AI-2026-10-15 FIX] 从新浪 nf_ 行情逗号串稳健提取「动态结算均价(今均价)」。
+
+    根因：新浪 nf_AG0/nf_M0 的均价位置随买卖盘档位填充数量漂移——
+        parts[9] 恒为 0；均价有时落在 [27]、有时落在 [29]（档位字段数不定）。
+        写死任一索引都会间歇性拿到 0 → 官方估值/当日VWAP 列恒空或闪烁。
+    做法：不写死索引，改为在尾部价格区间扫描最接近 (最高+最低)/2 的浮点字段
+        （均价≈当日典型均价，且在最新价 0.5~1.5 倍内，排除成交量等干扰字段）。
+    """
+    try:
+        latest = float(parts[latest_idx]) if len(parts) > latest_idx else 0.0
+        high = float(parts[high_idx]) if len(parts) > high_idx else 0.0
+        low = float(parts[low_idx]) if len(parts) > low_idx else 0.0
+    except (ValueError, IndexError):
+        return 0.0
+    if latest <= 0 or high <= 0 or low <= 0:
+        return 0.0
+    target = (high + low) / 2.0
+    best, best_diff = 0.0, 1e18
+    for v in parts[19:34]:
+        try:
+            f = float(v)
+        except (ValueError, IndexError):
+            continue
+        if f <= 0:
+            continue
+        # 均价贴近 (high+low)/2，且在最新价 0.5~1.5 倍内
+        if 0.5 * latest <= f <= 1.5 * latest:
+            diff = abs(f - target)
+            if diff < best_diff:
+                best, best_diff = f, diff
+    return best
 
 
 def _futures_session_open(symbol: str) -> bool:
@@ -1993,8 +2034,10 @@ class FundService:
                                     if len(parts) >= 11:
                                         ag_future_price = float(parts[8])   # 最新价
                                         settlement_price = float(parts[10])  # 昨结算价
-                                        # 新浪接口 part[9] 即为今日动态结算均价(VWAP)
-                                        vwap = float(parts[9]) if len(parts) > 9 else 0.0
+                                        # [AI-2026-10-15 FIX] 新浪 nf_AG0 实时格式中 parts[9] 恒为 0、
+                                        # parts[28] 也会随档位漂移为 0；改用稳健扫描提取均价，
+                                        # 否则 SSE/程序1 失效时 161226 官方估值/当日VWAP 也空白。
+                                        vwap = _extract_sina_vwap(parts)
                             except:
                                 pass
 
@@ -2149,17 +2192,44 @@ class FundService:
                         from arbcore.utils.sina_cache import get_sina_quotes
                         _m_session_open = is_dce_open()
                         m_future_price, m_settlement, m_vwap = 0.0, 0.0, 0.0
-                        try:
-                            _raw_map = get_sina_quotes(['nf_M0'])
-                            _raw = _raw_map.get('nf_M0')
-                            if _raw:
-                                _p = _raw.split(',')
-                                if len(_p) >= 11:
-                                    m_future_price = float(_p[8])     # 最新价
-                                    m_settlement   = float(_p[10])    # 昨结算价（上一交易日官方结算）
-                                    m_vwap         = float(_p[9]) if len(_p) > 9 and _p[9] else 0.0  # 动态结算均价
-                        except Exception as _e:
-                            logger.debug(f"[159985] 新浪 nf_M0 读取失败: {_e}")
+
+                        # [优先级1] 本程序自带的东财SSE长连接阅读器（结构对齐 ag0 白银块）。
+                        # 东财 SSE 仅订阅沪银(113_agm_qt)，大商所 M0 无对应 SSE 通道
+                        # （所有候选 URL 实测均返回空），故 m0_* 当前恒为 0；接入大商所 SSE 后此优先级自动生效。
+                        if _sse_reader.m0_price > 0 and _sse_reader.m0_settlement > 0:
+                            m_future_price = _sse_reader.m0_price
+                            m_settlement   = _sse_reader.m0_settlement
+                            m_vwap         = _sse_reader.m0_vwap
+
+                        # [优先级2] 若SSE还没数据（刚启动/无通道），尝试从程序1(5000端口)获取
+                        if m_future_price <= 0 or m_settlement <= 0:
+                            try:
+                                import requests
+                                r = requests.get("http://127.0.0.1:5000/api/futures", timeout=1.0)
+                                if r.status_code == 200:
+                                    f_data = r.json()
+                                    m0 = f_data.get('M0', {})
+                                    m_future_price = float(m0.get('price', 0))
+                                    m_settlement   = float(m0.get('settlement', 0))
+                                    m_vwap         = float(m0.get('vwap', 0))
+                            except:
+                                pass
+
+                        # [优先级3] 降级：新浪 nf_M0 接口补充（稳健提取均价，避免 parts[9]/parts[28] 漂移为0）
+                        if m_future_price <= 0 or m_settlement <= 0:
+                            try:
+                                _raw_map = get_sina_quotes(['nf_M0'])
+                                _raw = _raw_map.get('nf_M0')
+                                if _raw:
+                                    _p = _raw.split(',')
+                                    if len(_p) >= 11:
+                                        m_future_price = float(_p[8])     # 最新价
+                                        m_settlement   = float(_p[10])    # 昨结算价（上一交易日官方结算）
+                                        # [AI-2026-10-15 FIX] 新浪 nf_M0 均价位置漂移（parts[9]=0、parts[28] 有时也=0），
+                                        # 改用稳健扫描提取，与 161226 ag0 块完全同逻辑。
+                                        m_vwap         = _extract_sina_vwap(_p)  # 动态结算均价(今均价)
+                            except Exception as _e:
+                                logger.debug(f"[159985] 新浪 nf_M0 读取失败: {_e}")
                         # 实时链路未给昨结算价 → 切 DB 备用源（futures_daily symbol='M0'，上一交易日）
                         if m_settlement <= 0:
                             try:
@@ -3541,12 +3611,17 @@ DailyUpdater()._step4_fetch_prices()
             t1_data = {}
             try:
                 cursor = conn.cursor()
+                # [AI-2026-10-15 东哥定调 · 清账] 净值只认官方净值 h.nav，去掉 COALESCE(h.nav, f.nav)；
+                #   并摘掉随之失效的 fund_daily_factors LEFT JOIN（该 COALESCE 是它在此查询里的唯一用途，
+                #   且 (date,fund_code) 是主键 ⇒ 不参与行过滤、删除不改变结果行）。
+                #   与 get_fund_history 同口径（其注释原文：「净值只取官方净值 h.nav，缺失即返回 NULL…
+                #   绝不用 fund_daily_factors.nav 兜底（那是虚假的旧净值…曾导致 9-11 等 T+1 未公布日
+                #   错误显示成前一交易日净值）」）。注：t1_data['nav'] 当前无人消费，本改动行为惰性。
                 cursor.execute("""
-                    SELECT h.date, COALESCE(h.nav, f.nav) as nav, h.static_val,
+                    SELECT h.date, h.nav, h.static_val,
                            r.usd_cny_mid, h.calibration, h.price
                     FROM unified_fund_history h
                     LEFT JOIN exchange_rate r ON h.date = r.date
-                    LEFT JOIN fund_daily_factors f ON h.date = f.date AND h.fund_code = f.fund_code
                     WHERE h.fund_code = ?
                     ORDER BY h.date DESC LIMIT 1
                 """, (code,))

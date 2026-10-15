@@ -12,6 +12,21 @@ from .woody_telegram_client import FetchPalmmicroData
 
 logger = logging.getLogger(__name__)
 
+# [AI-2026-10-12 东哥拍板] QDII日本 5 只 hedge/calibration 硬编码冻结值（方案 A · 撤 woody 依赖）。
+# 值来源：arb_master.db fund_daily_factors 库内最后一次 woody 真值
+# （4 只 N225 = 2026-10-09 行；513800/TOPIX = 2025-09-29 行）。
+# 冻结目的：woody 上游 payload 日期停在 2026-10-09 但随时可能恢复推新值，
+# 硬编码保证对冲手数口径（hedge × round(calib×multiplier)）永久恒定、全读方同源。
+# ⚠️ 任何脚本/AI 禁止擅自更新此表——口径由东哥拍板，改动须东哥确认。
+_QDII_JP_FROZEN_HEDGE = {
+    "513000": (136508.840113, 126953.221305),  # 易方达日经225ETF
+    "159866": (169828.546392, 169828.546392),  # 华安日经225ETF
+    "513520": (131916.79887, 127959.294904),   # 工银日经225ETF
+    "513880": (150125.755581, 136614.437579),  # 华安日经225ETF(513880)
+    "513800": (9780.958888, 9291.910944),      # 南方日本东证指数ETF(513800)
+}
+
+
 class WoodyAPIService:
     @staticmethod
     def fetch_and_process(db, codes: list, backup_dir: str, source_id: str):
@@ -193,15 +208,44 @@ class WoodyAPIService:
             hed = float(f_data['hedge']) if f_data.get('hedge') is not None else None
             nav_val = float(f_data['netvalue']) if f_data.get('netvalue') else None
 
+            # [AI-2026-10-12 东哥拍板] QDII日本 5 只 hedge/calibration 写前硬编码冻结（方案 A · 撤 woody 依赖）：
+            # 无论 woody payload 停更还是恢复推新值，这 5 只写入 fund_daily_factors 的
+            # hedge/calibration 一律用 _QDII_JP_FROZEN_HEDGE 冻结值，保证对冲手数
+            # （hedge × round(calib×multiplier)）与全读方（get_base_data/static_valuation/
+            # _resolve_hedge_for_order/fund_service 显示回填）口径恒定同源。
+            # position/nav/CNYest 不冻结，照常随 payload 更新。
+            _frozen = _QDII_JP_FROZEN_HEDGE.get(fund_code)
+            if _frozen is not None:
+                hed, cal = _frozen
+
             # [AI-2026-08-20] 写入基准日数据
+            # [AI-2026-10-15 东哥定调 · 修「hedge 日期错位」] calibration/hedge/nav 三者都是
+            #   **基准日当天的观测值**，只属于 b_date（= woody payload 的 `date`）：
+            #     hedge(D) = XOP净值(D) × 人民币中间价(D) ÷ [ nav(D) − nav(D−1)×(1−pos) ]
+            #   即 hedge(D) 由 **D 日已公布的官方净值**推出，D 日净值没公布就不存在 hedge(D)。
+            #   实证（vps_sync 四份文件逐日交叉，2026-10-15 核）：
+            #     woody_2026-10-12  date=10-08  est=10-09  hedge=1378.29949
+            #     woody_2026-10-13  date=10-09  est=10-12  hedge=1377.678951
+            #     woody_2026-10-14  date=10-12  est=10-13  hedge=1378.776419
+            #     woody_2026-10-15  date=10-13  est=10-14  hedge=1380.677713
+            #   四行与 fund_daily_factors 里 date=10-08/10-09/10-12/10-13 的值逐行吻合，
+            #   亦与 woody 网页 10-09→1378 / 10-12→1379 / 10-13→1381 对齐 ⇒ 口径确认。
             db.upsert_fund_factor(date=b_date, fund_code=fund_code, calibration=cal, hedge=hed, position=pos, nav=nav_val)
 
-            # [AI-2026-08-20] 如果est_date存在且不同于b_date，也在est_date写入同样的因子
-            # 原因：历史数据显示日期列显示的是est_date（今天），但程序只用b_date（基准日）写入
-            # 导致历史页est_date行缺失hedge数据（如162411在8-19缺hedge）
+            # [AI-2026-08-20 立 → AI-2026-10-15 修订] est_date 行**只保留 position**（慢变量、
+            #   非「当日观测」），calibration/hedge/nav 一律写 None。
+            #   旧行为是把同一份三元组也写进 est_date ⇒ 「10-13 的 hedge 出现在 10-14 行」，
+            #   导出 CSV 与历史页对 hedge 整体前移一天（2026-10-15 东哥实测 162411 复现）。
+            #   缺失即留空，绝不把基准日的值伪装成 est_date 当天的值（SUPREME 铁律「不伪装」）。
+            #   安全性（改前逐一核过读方，取值不变）：
+            #     · dynamic_valuation.get_base_data / fund_service 展示回填 /
+            #       main._resolve_hedge_for_order 全是 `hedge IS NOT NULL ORDER BY date DESC LIMIT 1`
+            #       ⇒ 去掉 est_date 副本后自动回落到 b_date 行，取到的数一样；
+            #     · static_valuation 的 hedge 取自 base_row（基准行）而非当日行，不受影响；
+            #     · fund_service t1_data 的 `COALESCE(h.nav, f.nav)` 所取出的 nav 字段无人消费。
             if e_date and e_date != b_date:
-                db.upsert_fund_factor(date=e_date, fund_code=fund_code, calibration=cal, hedge=hed, position=pos, nav=nav_val)
-                logger.debug(f"  🔧 [{fund_code}] 回填 {e_date} 因子数据 (b_date={b_date}, est_date={e_date})")
+                db.upsert_fund_factor(date=e_date, fund_code=fund_code, calibration=None, hedge=None, position=pos, nav=None)
+                logger.debug(f"  🔧 [{fund_code}] 回填 {e_date} 仓位（hedge/校准/净值归基准日 {b_date}，不搬）")
             
             # 🌟 Woody API 返回了真实仓位时，同步更新 unified_fund_list.pos_ratio
             raw_pos = f_data.get('position')
