@@ -229,6 +229,8 @@ root_db_path = _resolve_db_path()
 tran_db_path = os.path.join(os.path.dirname(root_db_path), "arb_tran.db")
 logger.info(f"📂 Using database at {root_db_path}")
 # [AI-2026-10-10] 交易库已剥离至 LOFTrader，删除启动日志（tran_db 路径变量保留，ledger_service 仍使用）
+# 🔴 [AI-2026-10-15 东哥定调] ⚠️ 本路径**仅 full 模式（交易机）使用**；DASHBOARD_MODE(ARM/云端)
+#   一律走内存库，绝不在该路径上创建文件 —— 护栏见下方 tran_db 实例化处（修红线#6）。
 
 # [AI-2026-10-07] 主库自检（防呆）：必须跑在下方 DatabaseManager 实例化**之前** ——
 # 一旦路径解析失误，os.makedirs + sqlite3.connect（默认 READWRITE|CREATE）会先静默造出
@@ -283,7 +285,18 @@ except Exception as e:
 # [V3.11][AI-2026-08-16] 统一数据库路径（相对 workspace_root 推导，项目下移 src/ 后仍有效）
 db = DatabaseManager(db_path=root_db_path, include_trading=False)
 # [AI-2026-08-16] 交易独立库（含 user_trades/broker_redemption_fees/arbitrage_pairs/fund_fees 交易表）
-tran_db = DatabaseManager(db_path=tran_db_path, include_trading=True)
+# 🔴 [AI-2026-10-15 东哥定调 · 修红线#6「arb_tran.db 绝不得出现在 ARM」]
+#   交易库只在**交易机**（full 模式）存在。ARM/云端看板是纯展示副本，根本不存在交易数据，
+#   故这里不再实例化磁盘交易库 —— 掐断「启动即 os.makedirs + sqlite3.connect ⇒ 静默造出一个
+#   空 arb_tran.db」这条自建链（ARM 上 10-11 那份 221KB 遗留正是此产物，且删了必被重建）。
+#   ARM 侧改用**内存库**句柄：不落盘、无数据，读行为与"空交易库"完全一致
+#   （实测 get_fee_rate→0 / get_prev_close→0 / _get_usd_rate→经 ATTACH 主库正常出价）。
+#   写路径本就进不来：/api/ledger/* 与 /api/config/* 已被 _is_dashboard_denied 全线 403。
+if DASHBOARD_MODE:
+    tran_db = DatabaseManager(db_path=':memory:', include_trading=True)
+    logger.info("🛡️ [DASHBOARD_MODE] 交易库已禁用：改用内存库，不落盘、不创建 arb_tran.db")
+else:
+    tran_db = DatabaseManager(db_path=tran_db_path, include_trading=True)
 
 def _print_data_source_banners():
     """启动后统一打印各数据源连接状态（清晰的双层提醒标志）并写入里程碑日志"""
