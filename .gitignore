@@ -104,3 +104,6 @@ dist/
 #   该文件为死代码，但会公开暴露策略阈值 / 对冲标的映射，故取消跟踪、不再入库。
 #   唯一权威实现：LOFTrader/backend/services/rule_engine.py
 ArbDashboard/backend/services/rule_engine.py
+
+# --- [AI-2026-11-10] 移除 Playwright 调试缓存（10-12 遗留浏览器截图/yml，公开仓不应含） ---
+.playwright-mcp/
