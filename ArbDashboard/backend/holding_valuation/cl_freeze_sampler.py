@@ -18,7 +18,11 @@
       如 9 月 → 近月=11 月 CL2611）
     - WTI 两合约 = [近月, +1月]（如 9 月 → 2611/2612；10 月 → 2612/2701）
     - 下月自动滚动（如 10 月 → 2612/2701）
-  每个 NY 时点各抓 WTI 两合约 + Brent 书同月合约(如 2701，跨品种对冲反算用) → 每天 3 时点 × 3 合约 = 9 个价格。
+  [2026-11-10 换月 Bug 修复] 额外固定采「近月链起点 = 当月+1」（如 11 月 → 2612）：
+    此前该月只靠 etf_contract_exposure 的 Brent 书月份碰巧补上，换月工具把已交割
+    Brent 月停用后就会断供，而 016 观察表 / USO 近月腿正需要它。显式多采一个月，
+    按月自动滚动；不并入 get_active_cl_contracts() 以免改变生产估值默认合约口径。
+  每个 NY 时点逐合约抓取：WTI 两合约 + Brent 书同月合约 + 近月链起点。
   [2026-09-17 东哥拍板] 2610（主连）底层已滚过、估值对对冲无意义，停止采样；Brent 同月(2701)为跨品种对冲反算保留采样。
 
 部署：
@@ -373,12 +377,25 @@ def main() -> int:
         return 0
 
     now = ny_now()
-    # 动态计算当日活跃合约：WTI 有效近月±1（2611/2612）+ Brent 书合约月（同月 CL 跨品种对冲反算用，如 2701）
+    # 动态计算当日活跃合约：WTI 有效近月±1 + Brent 书合约月（跨品种对冲反算）
+    # + 近月链起点（当月+1，详见文件头 2026-11-10 说明）
     global CONTRACTS
     CONTRACTS = get_active_cl_contracts(now.date())
     for m in get_brent_hedge_months(args.db):
         if m not in CONTRACTS:
             CONTRACTS.append(m)
+    # [2026-11-10] 近月链起点（当月+1）：016 观察表与 USO/1671/03175 近月腿需要
+    # CL2612 这类合约；此前只靠 etf_contract_exposure 的 Brent 书月份「碰巧」补上，
+    # 换月工具把已交割 Brent 月停用后该月会断供。显式多采一个月，按月自动滚动。
+    # ⚠️ 不并入 get_active_cl_contracts() 的返回值：那会改变 selected_contract
+    #    （生产估值默认合约）的口径。本改动只扩大采样覆盖，不动估值口径。
+    nm, ny = now.month + 1, now.year
+    if nm > 12:
+        nm -= 12
+        ny += 1
+    near_chain = f"{ny % 100:02d}{nm:02d}"
+    if near_chain not in CONTRACTS:
+        CONTRACTS.append(near_chain)
     trade_date = now.strftime("%Y-%m-%d")
     point = args.point or detect_point(now)
     if point is None:
@@ -388,7 +405,7 @@ def main() -> int:
         log.info("%s 非美股交易日，跳过采样", trade_date)
         return 0
 
-    # 同时抓取两个远月合约
+    # 逐个抓取当日活跃合约链
     prices: dict[str, float] = {}
     for contract in CONTRACTS:
         try:

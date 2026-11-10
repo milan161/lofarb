@@ -4,10 +4,19 @@ import os
 import sys
 # 自动引导路径：确保能找到根目录下的 arbcore
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', '..')))
+# [AI-2026-11-10 修 VPS 告警断链] main.py:591-596 以
+#   [python, ".../backend/scheduler/daily_updater.py"] 起子进程 ⇒ sys.path[0] = backend/scheduler，
+#   backend/ 不在路径中 ⇒ 下方 `from services.alert_service import ...` 与 `..services` 相对导入
+#   **双双失败** ⇒ _send_alert=None ⇒ VPS 硬故障只写日志、电报一条不发（2026-10-20~11-07
+#   VPS 停机 19 天期间 ARM journald 里 674 条告警全部带「（告警通道不可用）」）。
+# 补 backend/ 进 sys.path：包方式导入时该路径已在，幂等不重复；不改动告警降级逻辑本身。
+_BACKEND_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+if _BACKEND_DIR not in sys.path:
+    sys.path.insert(0, _BACKEND_DIR)
 import json
 import yaml
 import logging
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 import pandas as pd
 import re
 import time
@@ -78,6 +87,14 @@ try:
 except ImportError:
     WOODY_USERNAME = WOODY_PASSWORD = None
     VPS_HOST, VPS_PORT, VPS_USER, VPS_PASSWORD, VPS_DATA_DIR, VPS_KEY_PATH, VPS_KEY_PASSWORD = None, 22, None, None, None, None, None
+
+# [AI-2026-10-13 东哥拍板] VPS_KEY_PATH / VPS_KEY_PASSWORD 支持环境变量覆盖：
+# 本机 account_private.py 写的是 Windows 开发机路径（本机正确）；部署到 ARM 后该路径不存在，
+# 导致 ARM→东京回退到密码认证。部署时由 sync_arm.sh 通过 systemd EnvironmentFile drop-in
+# 注入 VPS_KEY_PATH=/home/ubuntu/.ssh/id_ed25519，此处优先读环境变量，使 ARM 用真实 key 路径、
+# 且不改动凭据文件（凭据文件不随 deploy 推送）。本地不设 env → 用 account_private 原值。
+VPS_KEY_PATH = os.environ.get('VPS_KEY_PATH', VPS_KEY_PATH)
+VPS_KEY_PASSWORD = os.environ.get('VPS_KEY_PASSWORD', VPS_KEY_PASSWORD)
 
 # [AI-2026-08-02] 展示副本模式（ARM）：只自采「A股行情 + 富途美股夜盘」，
 # 其余静态数据一律从东京 VPS 只读，不在展示副本上重复造一套爬虫。
@@ -224,10 +241,20 @@ class DailyUpdater(BaseApp):
 
                 local_path = os.path.join(local_sync_dir, remote_file)
 
-                # [性能优化] 如果数据库已经同步过该日期，直接跳过（不依赖本地缓存文件，修复本地缓存被删除后重复下载的bug）
+                # [AI-2026-10-13] 修复「今日已同步→后续重跑误报无数据」：
+                # 跳过「重新下载 / 重新打标」，但仍要把本地已同步文件读进 synced_data_list；
+                # 否则当天首次同步成功后，每次重跑都返回空列表 → has_today 误判 False
+                # → step4P 的 `if vps_prices:` 为假 → 调 _vps_missing_alert 狂发 BOT。
+                # 仅当本地缓存文件也在时才计入（缓存被删则按未同步处理，保持旧行为）。
                 sync_key = f"{data_type}_vps_sync"
-                # [AI-2026-07-06] 移除 os.path.exists 要求：只要 access_sync_status 有标记就跳过，即使缓存文件被删除
                 if self.db.is_access_synced_today(sync_marker_key, sync_key):
+                    if os.path.exists(local_path):
+                        try:
+                            with open(local_path, 'r', encoding='utf-8') as f:
+                                content = json.load(f)
+                            synced_data_list.append({'date': file_date, 'content': content})
+                        except Exception as e:
+                            self.logger.warning(f"[VPS] 已同步文件本地读取失败(不计入): {remote_file}: {e}")
                     continue
 
                 # 3. 增量同步：如果本地不存在，则下载
@@ -293,33 +320,94 @@ class DailyUpdater(BaseApp):
             except Exception as e:
                 self.logger.error(f"🚨 [VPS-GAP] 告警发送异常: {e}")
 
-    def _vps_source_due_today(self, data_type: str) -> bool:
-        """[AI-2026-10-11 修误报] 该源「今天是否应有产出」——复刻东京 VPS 各脚本的交易日判据。
+    def _vps_session_day(self, data_type: str, d) -> bool:
+        """d 是否为该源的「数据归属交易日」——复刻东京 VPS 各脚本内置的市场日历。
 
-        采集类（T+1 凌晨采 T 日数据）看「昨天」；指数类（当日 16:30）看「今天」。
-        非产出日 → 无数据属正常，**绝不报警**（周日休市被误判为故障并狂发 BOT 的根因）。
+        🔴 [2026-11-09 事项3] 单一口径：`_vps_source_due_today`（告警判据）与
+        `_vps_expected_trade_date`（覆盖率判据）都走这里，杜绝两处日历漂移。
         """
-        today = datetime.now().date()
-        yesterday = today - timedelta(days=1)
+        ds = d.strftime('%Y-%m-%d')
         try:
             if data_type in ('shares', 'prices', 'nav'):
-                # A股：market_calendar 的 _HOLIDAYS_2026 已含 2026 全年（无需第三方库）
-                return is_trading_day('A_SHARE', yesterday)
+                # A股：market_calendar（chinese_calendar 可用时覆盖调休/法定假期）
+                return is_trading_day('A_SHARE', d)
             if data_type in ('usa_prices', 'etf_nav'):
-                return (yesterday.weekday() < 5
-                        and yesterday.strftime('%Y-%m-%d') not in _VPS_US_HOLIDAYS_2026)
+                return d.weekday() < 5 and ds not in _VPS_US_HOLIDAYS_2026
             if data_type == 'index':
-                d_s = today.strftime('%Y-%m-%d')
-                jp = today.weekday() < 5 and d_s not in _VPS_JPX_HOLIDAYS_2026
-                eu = today.weekday() < 5 and d_s not in _VPS_EU_HOLIDAYS_2026
+                jp = d.weekday() < 5 and ds not in _VPS_JPX_HOLIDAYS_2026
+                eu = d.weekday() < 5 and ds not in _VPS_EU_HOLIDAYS_2026
                 return jp or eu
             if data_type == 'hssi':
-                return is_trading_day('XHKG', today)
+                return is_trading_day('XHKG', d)
             # woody / fx / futures：VPS 脚本 cron 为 1-5 且无假日表 ⇒ 工作日必产
-            return today.weekday() < 5
+            return d.weekday() < 5
         except Exception as e:
             self.logger.warning(f"[VPS] {data_type} 交易日判据异常: {e}（保守按应产处理）")
             return True
+
+    def _vps_expected_trade_date(self, data_type: str) -> str:
+        """本次采集必须核对的「数据归属交易日」= 今天之前最近一个该源应产出的交易日。
+
+        🔴 [2026-11-09 事项3 根因修复 · 东哥拍板]：
+          · VPS 的 prices_/nav_/shares_ 每份文件都是**多日滚动窗口**（prices 单文件即
+            5 交易日 × 52 只 = 260 行；nav 21 天 × 52 = 1040 行），usa_prices 更是
+            48 标的全历史。旧判据把「所有历史文件里出现过的代码集合」当成「今日已覆盖」
+            ⇒ VPS 整月停机后，任意一份旧文件仍凑得出 52 只 ⇒ 打印「✅ 已全覆盖」并
+            静默 return：既不写新数据、也不报警，故障彻底隐形（10-15 起三个星期）。
+          · 正解遵循 docs/002_1 §九「定型只能问来源」：覆盖率必须绑定**目标交易日**，
+            只认来源行 `row.date == 目标交易日` 的记录；旧文件里再多的旧日期都不算数。
+        """
+        today = datetime.now().date()
+        for back in range(1, 15):
+            d = today - timedelta(days=back)
+            if self._vps_session_day(data_type, d):
+                return d.strftime('%Y-%m-%d')
+        return (today - timedelta(days=1)).strftime('%Y-%m-%d')
+
+    def _vps_coverage_window(self, data_type: str, target_date: str) -> tuple:
+        """来源行日期必须落在 (floor, target_date] 才算「新鲜」，否则只是历史文件。
+
+        滞后天数按源区分（自然日），只用来容纳真实的公布/休市时差，**不是前填**：
+          · prices 2  : T+1 03:00 必产 T 日收盘，留 2 天容周末；
+          · nav    4  : QDII欧美/黄金原油官方净值 T+2 公布（daily_updater:1259）；
+          · usa_prices 4 / shares 4 : 美股假期 + 周末 + 交易所份额公布时差。
+        ⚠️ 窗口上限固定为 target_date：早于目标日的旧行、晚于目标日的未来行都不算覆盖。
+        """
+        lag = {'prices': 2, 'nav': 4, 'usa_prices': 4, 'shares': 4}.get(data_type, 2)
+        t = date.fromisoformat(target_date)
+        return (t - timedelta(days=lag)).isoformat(), target_date
+
+    def _vps_row_is_fresh(self, row_date: str, window: tuple) -> bool:
+        floor, ceiling = window
+        return bool(row_date) and floor <= row_date <= ceiling
+
+    def _vps_coverage_ok(self, data_type: str, covered: set, expected: set,
+                         target_date: str) -> bool:
+        """按「目标交易日 + 来源」判覆盖率；缺新鲜数据一律按断供处理，绝不本地兜底。"""
+        if not covered:
+            self.logger.warning(
+                f"⚠️ [VPS-STALE] {data_type} 在目标交易日 {target_date} 附近无任何新鲜数据"
+                f"（历史文件不算）⇒ 判定为断供：报警 + 缺口留空，绝不本地兜底")
+            self._vps_missing_alert(data_type)
+            return False
+        if covered.issuperset(expected):
+            return True
+        self._vps_gap_alert(data_type, len(covered & expected), len(expected))
+        return False
+
+    def _vps_source_due_today(self, data_type: str) -> bool:
+        """[AI-2026-10-11 修误报] 该源「今天是否应有产出」。
+
+        采集类（T+1 凌晨采 T 日数据）看「昨天」；指数/港股类（当日 16:30）看「今天」；
+        woody/fx/futures 看工作日。判据统一走 `_vps_session_day`（与覆盖率同源）。
+        非产出日 → 无数据属正常，**绝不报警**（周日休市被误判为故障并狂发 BOT 的根因）。
+        """
+        today = datetime.now().date()
+        if data_type in ('index', 'hssi'):
+            return self._vps_session_day(data_type, today)
+        if data_type in ('woody', 'fx', 'futures'):
+            return today.weekday() < 5
+        return self._vps_session_day(data_type, today - timedelta(days=1))
 
     def _vps_missing_alert(self, data_type: str):
         """[AI-2026-10-11 东哥铁律 + 修误报] VPS 无今日数据时：
@@ -342,7 +430,17 @@ class DailyUpdater(BaseApp):
             if now < due:
                 self.logger.info(f"[VPS] {data_type} 未到预期产出时刻({exp}+30min)，现在 {now_hm}，本步留空")
                 return
-        # ③ 应为产出日 + 已过点(+宽限) 仍无数据 → 真异常，报警
+        # ③ 应为产出日 + 已过点(+宽限) → 先核实本地是否真缺今日文件，避免误报
+        # [AI-2026-10-13] 兜底：即便上游标记/本次同步列表为空，只要本地 {data_type}_{today}.json 已存在，
+        # 说明数据已落盘，绝非「无数据」，直接 return 不报警（Fix A 已让正常重跑看到今日文件，此为双保险）。
+        local_sync_dir = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                                       "..", "..", "..", "ArbDashboard", "data", "vps_sync"))
+        today_str = now.strftime('%Y-%m-%d')
+        today_file = os.path.join(local_sync_dir, f"{data_type}_{today_str}.json")
+        if os.path.exists(today_file):
+            self.logger.info(f"[VPS] {data_type} 本地今日文件已存在({today_file})，非缺失，不报警")
+            return
+        # 真异常，报警
         msg = f"{data_type} 今日无数据" + (f"（预期 {exp}，现已 {now_hm}）" if exp else "")
         self.logger.warning(f"🚨 [VPS-MISS] {msg} —— 按铁律不本地兜底，字段留空")
         if _send_alert is not None:
@@ -981,49 +1079,77 @@ class DailyUpdater(BaseApp):
         
         self.logger.info(f"🔧 [假期修复] 完成，修复 {fixed_count}/{len(codes_to_fix)} 只基金")
 
-    def _step4_fetch_prices(self):
-        """[AI-2026-07-28] 从腾讯日K线获取官方收盘价（非实时快照）
+    def _step4_fetch_prices(self, *, local_kline_only: bool = False):
+        """[AI-2026-07-28] 获取各基金官方收盘价 —— 两条**互斥的时序通道**（docs/002_1 §六/§十）
 
-        历史设计遗留：早期为分时溢价图采集盘中价格，后分时采样器已禁用
-        （enable_intraday_sampler=False），但取数源未同步改为官方收盘。
-        2026-07-28 修正：统一使用腾讯日K线 fqkline 接口的 close 字段，
-        与 woody/雪球 收盘价一分钱不差。
+        [2026-11-09 方案A·东哥拍板] 恢复盘后主通道。二者**不是兜底关系，是时序分工**：
+
+        ① ``local_kline_only=True`` —— 盘后 15:00 ``--daily-close`` 专用（**必要通道**）。
+           VPS 的 ``prices_{T}.json`` 要 **T+1 03:00** 才产出（docs/002_1 §二），
+           此刻 VPS 手里最多只有 T-1 的价；而 ``main.py::_after_hours_close_price_loop``
+           判据要的是 ``date=T`` 的 price ⇒ 若走 VPS-first，覆盖率判据再准也判不出
+           T 日数据，必然每 5 分钟空转到次日凌晨（本次故障的直接表现）。
+           故本通道**完全不看 VPS**，直连腾讯/新浪日K写 T 日官方收盘。
+           次日凌晨流水线（``local_kline_only=False``）拉到 VPS 权威文件后由
+           ``_safe_save_fund_data`` upsert 覆盖 ⇒ 最终态仍以 VPS 为**唯一真相源**，
+           本地只是"提前可见"，不制造第二个真相源。
+
+        ② ``local_kline_only=False``（默认）—— 凌晨 / 完整流水线，VPS-first + 10-11 铁律：
+           部分覆盖或断供一律「报警 + 留空」，**绝不本地兜底**。
         """
-        self.logger.info("=== 步骤4P：获取各基金收盘价 (腾讯日K线官方收盘) ===")
+        self.logger.info("=== 步骤4P：获取各基金收盘价 ===")
         today_str = datetime.now().strftime('%Y-%m-%d')
         conn_ufl = self.db._get_conn()
         all_codes = [str(r[0]) for r in conn_ufl.execute("SELECT fund_code FROM unified_fund_list").fetchall() if r[0]]
         conn_ufl.close()
-        self.logger.info(f"📋 共 {len(all_codes)} 只基金，开始从腾讯日K线获取官方收盘价...")
+
+        # ── 通道①：盘后公共日K（必要通道，非兜底） ──────────────────────────
+        if local_kline_only:
+            self.logger.info(
+                f"📋 [方案A·盘后公共日K] 共 {len(all_codes)} 只基金，"
+                f"直连腾讯/新浪写 {today_str} 官方收盘（VPS 的该日文件 T+1 03:00 才产）")
+            return self._fetch_prices_from_public_kline(all_codes, today_str)
+
+        # ── 通道②：VPS-first（凌晨 / 完整流水线，铁律不变） ───────────────────
+        self.logger.info(f"📋 共 {len(all_codes)} 只基金，走 VPS 优先通道...")
 
         # [AI-2026-10-10] VPS优先：先尝试从东京VPS拉取当日收盘价（prices_{date}.json），
         # 若全覆盖则直接返回，减少本地直连腾讯/新浪的请求量。
         vps_prices = self._try_sync_all_from_vps('prices')
         if vps_prices:
+            # [2026-11-09 事项3] 全历史照常入库（增量补历史），但**覆盖率只认目标交易日**
+            target_date = self._vps_expected_trade_date('prices')
+            window = self._vps_coverage_window('prices', target_date)
             vps_codes_covered = set()
             for entry in vps_prices:
                 content = entry.get('content', {})
                 for row in content.get('rows', []):
                     code_v = str(row.get('code', ''))
-                    date_v = row.get('date', '')
+                    date_v = str(row.get('date', ''))[:10]
                     close_v = row.get('close')
                     vol_v = row.get('volume', 0)
                     amt_v = row.get('amount_wan', 0)
                     if code_v and date_v and close_v and close_v > 0:
                         self._safe_save_fund_data(date_str=date_v, fund_code=code_v, price=close_v, trade_volume=vol_v, volume=amt_v)
-                        vps_codes_covered.add(code_v)
-            if vps_codes_covered.issuperset(set(all_codes)):
-                self.logger.info(f"✅ [VPS] 收盘价已全覆盖 {len(vps_codes_covered)} 只基金，跳过本地采集")
-                return
-            # [AI-2026-10-11 东哥铁律] 部分覆盖 → 报警 + 留空，不再本地兜底
-            self._vps_gap_alert('prices', len(vps_codes_covered), len(all_codes))
+                        if self._vps_row_is_fresh(date_v, window):
+                            vps_codes_covered.add(code_v)
+            if self._vps_coverage_ok('prices', vps_codes_covered, set(all_codes), target_date):
+                self.logger.info(f"✅ [VPS] 收盘价 {target_date} 已全覆盖 {len(vps_codes_covered)} 只基金，跳过本地采集")
+            # [AI-2026-10-11 东哥铁律] 部分覆盖 / 断供 → 报警 + 留空，不再本地兜底
             return
 
         # [AI-2026-10-11 东哥铁律] VPS 无今日收盘价 → 报警(超时) + 留空，不再本地兜底。
         self._vps_missing_alert('prices')
         return
 
-        # ===== 以下为原本地兜底（腾讯 / 新浪），已按铁律禁用，保留可回退 =====
+    def _fetch_prices_from_public_kline(self, all_codes, today_str):
+        """[2026-11-09 方案A·东哥拍板] T 日盘后公共日K通道：腾讯 fqkline 首选、新浪兜底。
+
+        原为 10-11「按铁律禁用、保留可回退」的 ``return`` 之后死代码；方案A 恢复为
+        **盘后必要主通道**（docs/002_1 §六「不是兜底，别误拆」）。写入统一走
+        ``_safe_save_fund_data``（upsert + 按 category 算 premium），次日凌晨
+        VPS 权威文件到达即覆盖。腾讯日K close 与 woody/雪球 收盘价一分钱不差。
+        """
 
         # [AI-2026-08-03] 无日K线基金跳过名单（持久化）：腾讯/新浪均无日K线的基金（债券/封闭LOF）
         # 首次探测到即写入 arbcore/config/no_kline_funds.json，后续启动直接跳过，不再刷 WARNING。
@@ -1204,21 +1330,23 @@ class DailyUpdater(BaseApp):
         # 全量导入后由下方 per-code expected_nav_date 检查自然跳过已补齐的 code。
         vps_nav = self._try_sync_all_from_vps('nav')
         if vps_nav:
+            # [2026-11-09 事项3] nav 单文件是 21 天滚动窗口，历史文件不能充当「今日已覆盖」
+            target_date = self._vps_expected_trade_date('nav')
+            window = self._vps_coverage_window('nav', target_date)
             vps_nav_codes = set()
             for entry in vps_nav:
                 content = entry.get('content', {})
                 for row in content.get('rows', []):
                     code_v = str(row.get('code', ''))
-                    date_v = row.get('date', '')
+                    date_v = str(row.get('date', ''))[:10]
                     nav_v = row.get('nav')
                     if code_v and date_v and nav_v:
                         self._safe_save_fund_data(date_str=date_v, fund_code=code_v, nav=nav_v)
-                        vps_nav_codes.add(code_v)
-            if vps_nav_codes.issuperset(set(all_codes)):
-                self.logger.info(f"✅ [VPS] 净值已全覆盖 {len(vps_nav_codes)} 只，跳过本地东财")
-                return
-            # [AI-2026-10-11 东哥铁律] 部分覆盖 → 报警 + 留空，不再本地兜底
-            self._vps_gap_alert('nav', len(vps_nav_codes), len(all_codes))
+                        if self._vps_row_is_fresh(date_v, window):
+                            vps_nav_codes.add(code_v)
+            if self._vps_coverage_ok('nav', vps_nav_codes, set(all_codes), target_date):
+                self.logger.info(f"✅ [VPS] 净值 {target_date} 已全覆盖 {len(vps_nav_codes)} 只，跳过本地东财")
+            # [AI-2026-10-11 东哥铁律] 部分覆盖 / 断供 → 报警 + 留空，不再本地兜底
             return
         # [AI-2026-10-11 东哥铁律] VPS 无今日净值 → 报警(超时) + 留空，不再本地兜底
         self._vps_missing_alert('nav')
@@ -1329,8 +1457,8 @@ class DailyUpdater(BaseApp):
             tmp = os.path.join(root, "database", "_ps_tmp.json")
             cmd = [sys.executable, tool, "pull",
                    "--host", ap.VPS_HOST, "--port", str(ap.VPS_PORT),
-                   "--user", ap.VPS_USER, "--key", ap.VPS_KEY_PATH,
-                   "--keypass", ap.VPS_KEY_PASSWORD or "",
+                   "--user", ap.VPS_USER, "--key", VPS_KEY_PATH,
+                   "--keypass", VPS_KEY_PASSWORD or "",
                    "--remote", "/root/ArbSiphon/data/purchase_status.json",
                    "--tmp", tmp]
             r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
@@ -1444,6 +1572,10 @@ class DailyUpdater(BaseApp):
         vps_usa_covered = set()
         vps_usa = self._try_sync_all_from_vps('usa_prices')
         if vps_usa:
+            # [2026-11-09 事项3] usa_prices 单文件是 48 标的全历史（18 万行），
+            # 旧判据必被旧文件凑满 ⇒ 覆盖率只认新鲜窗口内的行。
+            target_date = self._vps_expected_trade_date('usa_prices')
+            window = self._vps_coverage_window('usa_prices', target_date)
             for entry in vps_usa:
                 content = entry.get('content', {})
                 for row in content.get('rows', []):
@@ -1454,12 +1586,11 @@ class DailyUpdater(BaseApp):
                         self.db.upsert_usa_etf_price(date=date_v, symbol=sym_v, price=float(close_v))
                         if sym_v in index_write_syms:
                             self.db.upsert_index_history(symbol=sym_v, date=date_v, close=float(close_v))
-                        vps_usa_covered.add(sym_v)
-            if vps_usa_covered.issuperset(set(symbols)):
-                self.logger.info(f"✅ [VPS] 美股/指数日线已全覆盖 {len(vps_usa_covered)} 只，跳过本地")
-                return
-            # [AI-2026-10-11 东哥铁律] 部分覆盖 → 报警 + 留空，不再本地兜底
-            self._vps_gap_alert('usa_prices', len(vps_usa_covered), len(symbols))
+                        if self._vps_row_is_fresh(str(date_v)[:10], window):
+                            vps_usa_covered.add(sym_v)
+            if self._vps_coverage_ok('usa_prices', vps_usa_covered, set(symbols), target_date):
+                self.logger.info(f"✅ [VPS] 美股/指数日线 {target_date} 已全覆盖 {len(vps_usa_covered)} 只，跳过本地")
+            # [AI-2026-10-11 东哥铁律] 部分覆盖 / 断供 → 报警 + 留空，不再本地兜底
             return
         # [AI-2026-10-11 东哥铁律] VPS 无今日数据 → 报警(超时) + 留空，不再本地兜底
         self._vps_missing_alert('usa_prices')
@@ -1921,33 +2052,35 @@ class DailyUpdater(BaseApp):
         # 部分覆盖（如 30/35）严禁提前 return——否则未覆盖标的当日无份额，静默数据缺口。
         vps_shares = self._try_sync_all_from_vps('shares')
         if vps_shares:
+            # [2026-11-09 事项3] shares 单文件含 17 天滚动窗口，历史行不能充当今日覆盖
             expected_share_codes = set(self._share_codes())
+            target_date = self._vps_expected_trade_date('shares')
+            window = self._vps_coverage_window('shares', target_date)
             vps_rows_count = 0
-            vps_codes = set()
+            vps_codes = set()          # 全历史（仅日志）
+            fresh_codes = set()        # 新鲜窗口内（唯一判据）
             for entry in vps_shares:
                 content = entry.get('content', {})
                 for row in content.get('rows', []):
                     code_v = str(row.get('code', ''))
-                    date_v = row.get('date', '')
+                    date_v = str(row.get('date', ''))[:10]
                     shares_v = row.get('shares')
                     if code_v and date_v and shares_v is not None:
                         try:
                             self.db.save_unified_history(date_str=date_v, fund_code=code_v, shares=float(shares_v))
                             vps_rows_count += 1
                             vps_codes.add(code_v)
+                            if self._vps_row_is_fresh(date_v, window):
+                                fresh_codes.add(code_v)
                         except Exception as e:
                             self.logger.debug(f"   [VPS份额] 入库 {code_v} {date_v} 失败: {e}")
-            if expected_share_codes and expected_share_codes.issubset(vps_codes):
-                self.logger.info(f"📥 [VPS] 份额已导入 {vps_rows_count} 行（覆盖全部 {len(expected_share_codes)} 只标的），跳过本地直采")
-                self.db.mark_access_synced(today_str, source='shares_direct_sync')
+            if not expected_share_codes:
+                self.logger.warning("⚠️ [VPS] 份额标的清单为空，无法判覆盖，不标防刷")
                 return
-            if vps_rows_count > 0:
-                missing = sorted(expected_share_codes - vps_codes)
-                self.logger.warning(f"⚠️ [VPS] 份额覆盖不全（缺 {missing[:8]}），按铁律不本地兜底")
-                self._vps_gap_alert('shares', len(vps_codes & expected_share_codes), len(expected_share_codes))
-            else:
-                # 无今日份额（可能只是时滞：VPS 02:00 才产 shares）→ 未到点 info / 超时报警
-                self._vps_missing_alert('shares')
+            if self._vps_coverage_ok('shares', fresh_codes, expected_share_codes, target_date):
+                self.logger.info(f"📥 [VPS] 份额已导入 {vps_rows_count} 行（{target_date} 覆盖全部 {len(expected_share_codes)} 只标的），跳过本地直采")
+                self.db.mark_access_synced(today_str, source='shares_direct_sync')
+            # [AI-2026-10-11 东哥铁律] 部分覆盖 / 断供 → 报警 + 留空，不再本地直采
             return
         # [AI-2026-10-11 东哥铁律] VPS 无份额数据 → 报警 + 留空，不再本地直采
         self._vps_missing_alert('shares')
@@ -2640,7 +2773,10 @@ class DailyUpdater(BaseApp):
 
         if daily_close:
             self.logger.info("🚀 [收盘后更新] 仅写当日官方收盘价 + 净值 + 静态估值（公共API，不依赖VPS）...")
-            self._step4_fetch_prices()
+            # [2026-11-09 方案A·东哥拍板] 盘后走「公共日K必要通道」，不进 VPS-first：
+            # VPS prices_{T} 要 T+1 03:00 才产，此刻走 VPS 会让 main.py 盘后循环空转到次日。
+            # 这里与 run() 分支原有的「公共API，不依赖VPS」注释一致 —— 10-11 改判据时被误伤。
+            self._step4_fetch_prices(local_kline_only=True)
             self.step4_fetch_lof_market()
             # [AI-2026-08-31] AG0 官方结算价**只在盘后产生**：盘中(<15:00) futures_daily 不写 AG0
             # （VWAP 不能当结算价，也不拿昨结算兜底）。故收盘后必须再抓一次期货数据，
@@ -2699,7 +2835,9 @@ class DailyUpdater(BaseApp):
         if now.weekday() in (5, 6):
             self.logger.info("📅 [周末·回退开关已开] 执行轻量块：净值+收盘价+Woody补采+静态估值+美股补采...")
             self.step4_fetch_lof_market()
-            # [AI-2026-07-25] 周末也跑收盘价采集（腾讯API），否则 LOF 收盘价缺失
+            # [AI-2026-07-25] 周末轻量块也取收盘价，否则 LOF 收盘价缺失
+            # [2026-11-09 方案A] 此处仍走 VPS-first（默认）：该块的目的是补历史 VPS 文件，
+            #   不是写「T 日盘后价」；盘后腾讯通道已独立到 --daily-close，别混。
             self._step4_fetch_prices()
             # [AI-2026-07-25] 周末也跑 step1：从 VPS 补采缺失的 Woody 因子数据
             self.step1_and_2_fetch_woody_api()

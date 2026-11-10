@@ -28,14 +28,38 @@ from pathlib import Path
 
 log = logging.getLogger("alert")
 
-COOLDOWN = 600          # 同一 key 防刷窗口（秒）
+# [AI-2026-10-14] 冷却窗口默认 6h（21600s），可用环境变量 LOFARB_ALERT_COOLDOWN 覆盖。
+# 6h 既能瞬间压住「15 分钟 40+ 条」的突发轰炸，又保留持续故障的每日心跳提醒。
+COOLDOWN = int(os.environ.get("LOFARB_ALERT_COOLDOWN", "21600"))
+
+# [AI-2026-10-14] 持久化去重中继：跨进程/跨后端重启生效，根治 40+ 条轰炸。
+# alert_service 是所有 LOFarb Telegram 告警的唯一出口，去重在此处做最彻底。
+try:
+    from services.alert_dedup import (
+        is_allowed as _dd_allowed,
+        mark_sent as _dd_mark,
+        dedup_key as _dd_key,
+    )
+except Exception:  # pragma: no cover - 兜底：去重模块缺失时绝不吞掉告警
+    try:
+        from .alert_dedup import (
+            is_allowed as _dd_allowed,
+            mark_sent as _dd_mark,
+            dedup_key as _dd_key,
+        )
+    except Exception:
+        def _dd_allowed(k, c=21600):
+            return True
+        def _dd_mark(k):
+            pass
+        def _dd_key(pk=None, t=None):
+            return pk or "h:unknown"
 SSH_ALIAS = "arm"       # 本机 ~/.ssh/config 别名（免密）
 ARM_SECRETS = "/home/ubuntu/account_info/secrets.py"
 # [AI-2026-10-11 东哥要求] 本机(Windows/国内) 直连 Telegram 必然失败（被墙）
 # ⇒ 直接走 ARM 转发，不再白等 6s 超时。ARM(Linux) 上仍先试直连。
 _IS_LOCAL = (os.name == "nt")
 
-_last_sent = {}         # key -> 上次成功发送的 ts
 _broken_until = 0.0     # 熔断截止 ts
 _direct_ok = None       # None=未知 / True=直连可用 / False=直连不通（改走 ARM 转发）
 
@@ -111,7 +135,8 @@ def send_alert(msg: str, level: str = "warn", key: str = None) -> bool:
 
     链路：① 直连 → ② 失败则经 ARM 转发 → ③ 都失败则熔断 5 分钟。
     被防刷 / 未配置凭据 / 发送失败 → 返回 False（均只记日志，绝不抛错）。
-    level: info | warn | error；key: 防刷键（COOLDOWN 秒内只发一次），None 不去重。
+    level: info | warn | error；key: 防刷键（COOLDOWN 秒内只发一次），None 按正文 hash 兜底。
+    去重状态落盘（alert_dedup），跨进程/跨重启生效，根治 40+ 条轰炸。
     """
     global _broken_until, _direct_ok
     icon = {"info": "ℹ️", "warn": "⚠️", "error": "🚨"}.get(level, "⚠️")
@@ -120,8 +145,10 @@ def send_alert(msg: str, level: str = "warn", key: str = None) -> bool:
     if time.time() < _broken_until:
         log.warning("告警通道熔断中(剩余%ds)，跳过: %s", int(_broken_until - time.time()), msg)
         return False
-    if key and (time.time() - _last_sent.get(key, 0) < COOLDOWN):
-        log.info("告警被防刷跳过(key=%s): %s", key, msg)
+    # [AI-2026-10-14] 持久化去重：跨进程/跨重启生效，根治 40+ 条轰炸
+    dk = _dd_key(key, text)
+    if not _dd_allowed(dk, COOLDOWN):
+        log.info("告警被防刷跳过(持久去重 key=%s): %s", dk, msg)
         return False
     if not _enabled():
         log.warning("告警未配置 Telegram 凭据，仅记日志: %s", text)
@@ -139,8 +166,7 @@ def send_alert(msg: str, level: str = "warn", key: str = None) -> bool:
             log.info("告警已发送(经 ARM 转发): %s", text)
 
     if ok:
-        if key:
-            _last_sent[key] = time.time()
+        _dd_mark(dk, COOLDOWN)
         return True
 
     _broken_until = time.time() + 300

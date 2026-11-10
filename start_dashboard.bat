@@ -47,8 +47,9 @@ set "ARB_MASTER_DB=%SCRIPT_DIR%\..\..\_shared\arb_master.db"
 :: 系统 OpenSSH 能正确读取 .ssh/config 的 arm/opend 别名。把系统目录置顶即可，ARM(Linux)不受影响。
 set "PATH=C:\Windows\System32\OpenSSH;%PATH%"
 
-:: 稳健清理 8000(后端)/5173(前端) 残留进程：PowerShell 精确按端口取 OwningProcess 强杀，规避 netstat 列解析落空
+:: [AI-2026-11-10] Robust kill: by port 8000/5173, then by command-line match *ArbDashboard*main.py* to catch zombies not yet bound to a port.
 powershell -NoProfile -Command "foreach($p in @(8000,5173)){ Get-NetTCPConnection -LocalPort $p -State Listen -ErrorAction SilentlyContinue | ForEach-Object { Stop-Process -Id $_.OwningProcess -Force -ErrorAction SilentlyContinue } }"
+powershell -NoProfile -Command "Get-CimInstance Win32_Process | Where-Object { $_.Name -like 'python*.exe' -and $_.CommandLine -and $_.CommandLine -like '*ArbDashboard*main.py*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }"
 :: 等待 8000 端口真正释放（最多 10 秒）再启动后端，杜绝旧进程赖着导致新进程绑端口失败
 powershell -NoProfile -Command "for($i=0;$i -lt 10;$i++){ if(-not (Get-NetTCPConnection -LocalPort 8000 -State Listen -ErrorAction SilentlyContinue)){ break }; Start-Sleep -Seconds 1 }"
 

@@ -1765,6 +1765,21 @@ class FundService:
             _today_bj = datetime.now(timezone(timedelta(hours=8))).strftime('%Y-%m-%d')
             # [AI-2026-10-09 方案A] A股交易时段判据（现价列盘中实时价覆盖的休市守卫）
             from arbcore.utils.market_calendar import is_a_share_session
+            # [AI-2026-11-09 东哥拍板] 盘中「昨收」必须严格等于上一个 A 股交易日。
+            #   复用 arbcore 交易日历（含法定假日/调休补班），循环外只算一次，避免逐基金重复推算。
+            #   日历不可用时 _expected_prev_d=None ⇒ 守卫降级为「距今 7 自然日」模糊窗口，
+            #   保证任何异常都不会中断整列涨跌幅计算。
+            try:
+                from arbcore.utils.market_calendar import is_trading_day as _cal_td_guard
+                _prev_td_d = datetime.strptime(_today_bj, '%Y-%m-%d').date() - timedelta(days=1)
+                for _ in range(15):
+                    if _cal_td_guard('A_SHARE', _prev_td_d):
+                        break
+                    _prev_td_d -= timedelta(days=1)
+                _expected_prev_d = _prev_td_d.strftime('%Y-%m-%d')
+            except Exception as _e_guard:
+                logger.warning(f"[涨跌幅] A股交易日历不可用({_e_guard})，陈旧守卫降级为 7 自然日窗口")
+                _expected_prev_d = None
             for _, fund in funds_df.iterrows():
                 code = fund['fund_code']
                 _vf_start = time.perf_counter()  # [埋点A] 逐基金计时起点
@@ -1856,7 +1871,37 @@ class FundService:
                         _intraday = trading_day and is_a_share_session() and _latest_d != _today_bj
                         if _intraday:
                             # 交易日盘中且今日尚未收盘入库 ⇒ 最新一行即"昨收"
-                            metrics['prev_close'] = valid_prices.iloc[0]['price']
+                            # [AI-2026-11-09 东哥拍板 v2] 陈旧基准守卫（口径级修正，非打补丁）：
+                            #   v1 判据「距今 <= 7 自然日」只是模糊窗口，堵不住「隔了几天的旧行」：
+                            #   本机 + 东京 VPS 10-15~11-08 长时间停机后主库断更到 10-16，
+                            #   11-09 恢复时 price 已被今日实时价覆盖 ⇒ price_change 变成跨
+                            #   16 个交易日的累计涨跌幅（160723 -5.76%、161226 -12.56%、
+                            #   162411 -9.69%）却被当作当日涨跌幅展示；同理 11-10 开盘时若
+                            #   11-09 收盘价尚未落库，仅隔 4 天 v1 也不会触发，仍会给出假数。
+                            #   正解：盘中昨收必须**严格等于上一个 A 股交易日**（_expected_prev_d，
+                            #   由交易日历推算），否则 prev_close=None → 前端显 "--"，宁缺毋假。
+                            #   只作用于 _intraday 分支；盘后/周末仍走 iloc[1] 显示最后交易日
+                            #   真实涨跌幅，避免重蹈 10-11「整列恒 0.00%」的日历守卫覆辙。
+                            if _expected_prev_d is not None:
+                                _stale = str(_latest_d)[:10] != _expected_prev_d
+                                _reason = f"≠ 上一交易日 {_expected_prev_d}"
+                            else:
+                                try:
+                                    _gap_days = (
+                                        datetime.strptime(_today_bj, '%Y-%m-%d').date()
+                                        - datetime.strptime(str(_latest_d)[:10], '%Y-%m-%d').date()
+                                    ).days
+                                except Exception:
+                                    _gap_days = 0
+                                _stale = _gap_days > 7
+                                _reason = f"距今 {_gap_days} 天(日历降级)"
+                            if _stale:
+                                logger.warning(
+                                    f"[涨跌幅] {code} 最新行情日 {str(_latest_d)[:10]} {_reason}，"
+                                    f"基准陈旧，涨跌幅显 --（禁止用累计涨跌幅冒充当日涨跌幅）")
+                                metrics['prev_close'] = None
+                            else:
+                                metrics['prev_close'] = valid_prices.iloc[0]['price']
                         elif len(valid_prices) >= 2:
                             metrics['prev_close'] = valid_prices.iloc[1]['price']
                         else:

@@ -1203,10 +1203,38 @@ try:
         out["futures"] = mx("SELECT MAX(date) FROM futures_daily")
         out["fund_factors"] = mx("SELECT MAX(date) FROM fund_daily_factors")
         out["index_hist"] = mx("SELECT MAX(date) FROM index_history")
-        cur.execute("SELECT MAX(sync_date), MAX(sync_time) FROM access_sync_status")
-        rr = cur.fetchone()
-        out["vps_sync_date"] = rr[0] if rr else None
-        out["vps_sync_time"] = rr[1] if rr else None
+        # [2026-11-10 东哥拍板] 补 4 类此前漏报的源：
+        #   oil7       = 三原油基金持仓估值所需的 7 只底层 ETF/ETC 单标的，取「最差(最旧/缺失)」最新日；
+        #               任一缺失 → COALESCE 落 '0000-00-00' → 整行报缺失（避免被 VPS 的 USO/SPY 掩盖）。
+        # [2026-11-10] oil7 = 三原油底层 7 只「最差(最旧/缺失)」最新日；任一缺失 → '0000-00-00'。
+        # 用 Python 侧 min（不依赖 VALUES 相关子查询，ARM 旧版 sqlite 执行该 SQL 会静默异常返回 None）
+        _oil_syms = ["CRUD", "BRNT", "03175", "SLV", "OILUSA", "1671", "1699"]
+        _oil_maxes = [mx("SELECT MAX(date) FROM usa_etf_daily_prices WHERE symbol='%s'" % s) for s in _oil_syms]
+        out["oil7"] = min([m if m else "0000-00-00" for m in _oil_maxes])
+        out["cl_freeze"] = mx("SELECT MAX(trade_date) FROM futures_freeze_prices")
+        out["eu_futures"] = mx("SELECT MAX(trade_date) FROM eu_futures_quotes")
+        out["shares"] = mx("SELECT MAX(date) FROM unified_fund_history WHERE shares IS NOT NULL")
+        # [2026-11-10 东哥拍板] 补 2 类 VPS 采集项（与前端 SOURCE_ORDER / docs/002_1 §十二 同口径）：
+        #   etf_nav        = 美股ETF净值(雅虎/Invesco)，step5c 写入 usa_etf_daily_prices.netvalue（N225 已剔除）
+        #   purchase_status = 申赎状态，落独立表 fund_purchase_status（ufh.purchase_status 列恒空，勿取）
+        out["etf_nav"] = mx("SELECT MAX(date) FROM usa_etf_daily_prices WHERE netvalue IS NOT NULL")
+        out["purchase_status"] = mx("SELECT MAX(date(updated_at)) FROM fund_purchase_status")
+        # [2026-11-10 修复] access_sync_status.sync_date 实为复合串(如 TOPIX_2026-11-09/N225_2026-11-09)，
+        # MAX(sync_date) 取到的是字符串而非日期，前端 new Date() 解析失败→误判「缺失」。
+        # 改用真实的最后同步时间戳 MAX(sync_time)，再拆出 日期/时间 两部分。
+        # [2026-11-10 修复] access_sync_status.sync_time 混存两种格式：
+        #   新行=完整时间戳 'YYYY-MM-DD HH:MM:SS'；旧垃圾行=仅时间 'HH:MM:SS'(如 2026-06-06 那行)。
+        # 旧 MAX(sync_time) 走字典序，'23:24:21' > '2026-...' ⇒ 误取旧值 → 前端 new Date() 解析失败误标「缺失」。
+        # GLOB 的 '_' 是字面下划线(非通配)，故不能靠 SQL 过滤；改用 Python 侧判定：
+        #   仅取长度≥19 且第5/8位是'-'、第11位是空格 的「YYYY-MM-DD HH:MM:SS」真实时间戳，再 max，拆日期/时间。
+        cur.execute("SELECT sync_time FROM access_sync_status")
+        _st_times = []
+        for (_st_row,) in cur.fetchall():
+            if _st_row and len(_st_row) >= 19 and _st_row[4] == '-' and _st_row[7] == '-' and _st_row[10] == ' ':
+                _st_times.append(_st_row)
+        _st = max(_st_times) if _st_times else None
+        out["vps_sync_date"] = _st[:10] if _st else None
+        out["vps_sync_time"] = _st[11:] if (_st and len(_st) > 10) else None
         con.close()
 except Exception as e:
     out["_error"] = str(e)
@@ -1234,10 +1262,38 @@ def _build_freshness_report(db_path: str) -> dict:
         out["futures"] = mx("SELECT MAX(date) FROM futures_daily")
         out["fund_factors"] = mx("SELECT MAX(date) FROM fund_daily_factors")
         out["index_hist"] = mx("SELECT MAX(date) FROM index_history")
-        cur.execute("SELECT MAX(sync_date), MAX(sync_time) FROM access_sync_status")
-        rr = cur.fetchone()
-        out["vps_sync_date"] = rr[0] if rr else None
-        out["vps_sync_time"] = rr[1] if rr else None
+        # [2026-11-10 东哥拍板] 补 4 类此前漏报的源：
+        #   oil7       = 三原油基金持仓估值所需的 7 只底层 ETF/ETC 单标的，取「最差(最旧/缺失)」最新日；
+        #               任一缺失 → COALESCE 落 '0000-00-00' → 整行报缺失（避免被 VPS 的 USO/SPY 掩盖）。
+        # [2026-11-10] oil7 = 三原油底层 7 只「最差(最旧/缺失)」最新日；任一缺失 → '0000-00-00'。
+        # 用 Python 侧 min（不依赖 VALUES 相关子查询，ARM 旧版 sqlite 执行该 SQL 会静默异常返回 None）
+        _oil_syms = ["CRUD", "BRNT", "03175", "SLV", "OILUSA", "1671", "1699"]
+        _oil_maxes = [mx("SELECT MAX(date) FROM usa_etf_daily_prices WHERE symbol='%s'" % s) for s in _oil_syms]
+        out["oil7"] = min([m if m else "0000-00-00" for m in _oil_maxes])
+        out["cl_freeze"] = mx("SELECT MAX(trade_date) FROM futures_freeze_prices")
+        out["eu_futures"] = mx("SELECT MAX(trade_date) FROM eu_futures_quotes")
+        out["shares"] = mx("SELECT MAX(date) FROM unified_fund_history WHERE shares IS NOT NULL")
+        # [2026-11-10 东哥拍板] 补 2 类 VPS 采集项（与前端 SOURCE_ORDER / docs/002_1 §十二 同口径）：
+        #   etf_nav        = 美股ETF净值(雅虎/Invesco)，step5c 写入 usa_etf_daily_prices.netvalue（N225 已剔除）
+        #   purchase_status = 申赎状态，落独立表 fund_purchase_status（ufh.purchase_status 列恒空，勿取）
+        out["etf_nav"] = mx("SELECT MAX(date) FROM usa_etf_daily_prices WHERE netvalue IS NOT NULL")
+        out["purchase_status"] = mx("SELECT MAX(date(updated_at)) FROM fund_purchase_status")
+        # [2026-11-10 修复] access_sync_status.sync_date 实为复合串(如 TOPIX_2026-11-09/N225_2026-11-09)，
+        # MAX(sync_date) 取到的是字符串而非日期，前端 new Date() 解析失败→误判「缺失」。
+        # 改用真实的最后同步时间戳 MAX(sync_time)，再拆出 日期/时间 两部分。
+        # [2026-11-10 修复] access_sync_status.sync_time 混存两种格式：
+        #   新行=完整时间戳 'YYYY-MM-DD HH:MM:SS'；旧垃圾行=仅时间 'HH:MM:SS'(如 2026-06-06 那行)。
+        # 旧 MAX(sync_time) 走字典序，'23:24:21' > '2026-...' ⇒ 误取旧值 → 前端 new Date() 解析失败误标「缺失」。
+        # GLOB 的 '_' 是字面下划线(非通配)，故不能靠 SQL 过滤；改用 Python 侧判定：
+        #   仅取长度≥19 且第5/8位是'-'、第11位是空格 的「YYYY-MM-DD HH:MM:SS」真实时间戳，再 max，拆日期/时间。
+        cur.execute("SELECT sync_time FROM access_sync_status")
+        _st_times = []
+        for (_st_row,) in cur.fetchall():
+            if _st_row and len(_st_row) >= 19 and _st_row[4] == '-' and _st_row[7] == '-' and _st_row[10] == ' ':
+                _st_times.append(_st_row)
+        _st = max(_st_times) if _st_times else None
+        out["vps_sync_date"] = _st[:10] if _st else None
+        out["vps_sync_time"] = _st[11:] if (_st and len(_st) > 10) else None
         con.close()
     except Exception as e:
         out["_error"] = str(e)

@@ -186,6 +186,9 @@ def is_trading_day(exchange: str, d: date = None) -> bool:
     
     # A股用 chinese_calendar
     if exchange == 'A_SHARE':
+        # [东哥 2026-10-13 拍板] 补班周末（如 2026-10-10 周六补班）A股休市，不当作交易日。
+        # 必须先按 weekday>=5 短路返回 False，再走 chinese_calendar.is_workday——后者会识别调休补班日
+        # 把补班周六判成「开市」，若先调它反而把非交易日误判为交易日。周末过滤优先是 A股正确口径。
         if d.weekday() >= 5:
             return False
         if _HAS_CHINESE_CALENDAR:

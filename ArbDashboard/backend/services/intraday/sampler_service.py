@@ -2,7 +2,6 @@ import asyncio
 import logging
 from datetime import datetime
 import pandas as pd
-from arbcore.calculators.dynamic_valuation import DynamicValuationCalculator
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +53,11 @@ class IntradaySamplerService:
     负责在交易时段采集实时价格、实时估值、实时溢价率并存入数据库。
     """
     def __init__(self, db_manager, market_data_service, config_service):
+        # [AI-2026-10-15] 延迟 import 打破独立进程导入时的循环依赖
+        # （sampler_service → dynamic_valuation → valuation_data_engine/unified_valuation
+        #  → ... → 间接回到 sampler_service）。移至 __init__ 内，运行时所有模块已加载，
+        # 不再循环；且未来即便在 main.py 重新实例化 sampler 也更稳健。
+        from arbcore.calculators.dynamic_valuation import DynamicValuationCalculator
         self.db = db_manager
         self.market_data = market_data_service
         self.config_service = config_service
@@ -61,6 +65,9 @@ class IntradaySamplerService:
         self.running = False
         self._task = None
         self.active_watchlist = []
+        # [AI-2026-10-15] 采样目标基金（与东哥指定常用基金一致）；
+        # 同时作为启动后订阅实时源的符号集合（独立守护进程不会自动订阅 → 缓存空 → 取价 None）。
+        self.target_codes = {'162411', '164701', '161116'}
         self.lof_prices = {}   # [2026-08-21] LOF买卖一价缓存
         self.etf_prices = {}   # [2026-08-21] ETF买卖一价缓存
 
@@ -102,6 +109,20 @@ class IntradaySamplerService:
             return
             
         self.running = True
+
+        # [AI-2026-10-15] 订阅目标基金到实时源（腾讯/新浪缓存依赖订阅才能取到价）。
+        # 独立守护进程里 realtime_manager 不会自动订阅这些代码 → 缓存为空 →
+        # get_realtime_quote 返回 None → LOF 价格线 0 行。这里在启动后显式订阅，
+        # 与 arb-dashboard 行为一致（看板会订阅其配置基金）。ETF 篮子标的(GLD/XOP)由
+        # 富途自动连接守护按白名单订阅，本处只订阅 LOF 主代码。
+        try:
+            rm = getattr(self.market_data, 'realtime_manager', None)
+            if rm is not None:
+                rm.subscribe(list(self.target_codes))
+                logger.info(f"📡 分时采样已订阅实时源符号: {sorted(self.target_codes)}")
+        except Exception as e:
+            logger.warning(f"⚠️ 订阅实时源符号失败(非致命): {e}")
+
         self._task = asyncio.create_task(self._sampling_loop())
         logger.info("分时采样服务已启动")
 
@@ -157,7 +178,8 @@ class IntradaySamplerService:
 
             # [AI-2026-08-20] 东哥指定常用基金：162411（华宝油气）+ 164701（汇添富贵金属）+ 161116（易方达黄金）
             # 最多5只，每只每天约240条（4小时×60分钟），5只 = 1200条/天，10天 = 12000条 ≈ 2MB
-            target_codes = {'162411', '164701', '161116'}
+            # [AI-2026-10-15] 改用 self.target_codes（唯一来源，避免与 __init__ 重复定义漂移）
+            target_codes = self.target_codes
             
             funds_to_sample = []
             for f in all_config_funds:

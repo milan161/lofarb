@@ -1594,6 +1594,15 @@ class HoldingService:
         conn.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS uq_exp_fund_etf_month "
             "ON etf_contract_exposure(fund_code, etf, contract_month)")
+        # [2026-11-10] DB 唯一权威护栏：静态种子是 2026-09-17 的合约月快照，
+        # 表一旦由 deploy/roll_oil_contracts.py 按月换月维护（存在更晚的 as_of），
+        # 就不能再用旧种子补种 —— 否则已停用/已交割的过期合约月会被重新写回，
+        # 导致采样器继续抓死价、hedge_plan 推荐空已摘牌合约。
+        cur_as_of = conn.execute(
+            "SELECT MAX(as_of) FROM etf_contract_exposure").fetchone()[0]
+        if cur_as_of and cur_as_of > ETF_EXPOSURE_AS_OF:
+            conn.commit()
+            return
         for fund, rows in ETF_EXPOSURE_SEED.items():
             conn.executemany(
                 "INSERT OR IGNORE INTO etf_contract_exposure "
