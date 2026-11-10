@@ -89,10 +89,13 @@ except ImportError:
     VPS_HOST, VPS_PORT, VPS_USER, VPS_PASSWORD, VPS_DATA_DIR, VPS_KEY_PATH, VPS_KEY_PASSWORD = None, 22, None, None, None, None, None
 
 # [AI-2026-10-13 东哥拍板] VPS_KEY_PATH / VPS_KEY_PASSWORD 支持环境变量覆盖：
-# 本机 account_private.py 写的是 Windows 开发机路径（本机正确）；部署到 ARM 后该路径不存在，
+# 本机 account_private.py 写的是 Windows 开发机路径（本机正确）；部署到 ARM 后该路径无效，
 # 导致 ARM→东京回退到密码认证。部署时由 sync_arm.sh 通过 systemd EnvironmentFile drop-in
-# 注入 VPS_KEY_PATH=/home/ubuntu/.ssh/id_ed25519，此处优先读环境变量，使 ARM 用真实 key 路径、
+# 注入 VPS_KEY_PATH=/home/ubuntu/.ssh/arbsync_ed25519，此处优先读环境变量，使 ARM 用真实 key 路径、
 # 且不改动凭据文件（凭据文件不随 deploy 推送）。本地不设 env → 用 account_private 原值。
+# 🔴 [AI-2026-11-10 修] 该 key **必须是无口令的自动化密钥**：曾误注入本机交互式私钥
+# （带 passphrase）⇒ 下面 Ed25519Key.from_private_key_file 抛 PasswordRequiredException
+# （VPS_KEY_PASSWORD 在 ARM 为空）⇒ 降级密码认证 ⇒ VPS 已禁密码 ⇒ ARM→VPS 恒断链。
 VPS_KEY_PATH = os.environ.get('VPS_KEY_PATH', VPS_KEY_PATH)
 VPS_KEY_PASSWORD = os.environ.get('VPS_KEY_PASSWORD', VPS_KEY_PASSWORD)
 
@@ -1314,10 +1317,110 @@ class DailyUpdater(BaseApp):
             else:
                 self.logger.info(f"⏭️ [{code}] 无新历史收盘价需写入（今日盘中跳过）")
 
+    # ── [2026-11-10 东哥新机制] 净值补位辅助方法 ──────────────────────────────
+    def _expected_nav_date(self, code, category, bj_now):
+        """某基金「预期最新净值日」(北京时间)：
+          · 黄金原油 / QDII欧美：盘中 T-2、15:00后 T-1（美股基金 T+2 公布，盘前未见 T-1）
+          · 国内LOF/指数LOF/QDII亚洲/QDII日本：与 A 股同日收盘，盘中 T-1、盘后 T
+          · 其他：始终 T-1
+        注意：本程序跑在 UTC 机，datetime.now() 是 UTC，必须用北京时间 bj_now（+8）。"""
+        T2_CATEGORIES = {'黄金原油', 'QDII欧美'}            # 商品QDII/美股QDII，盘后 T-1（东哥11-10实测：两者11-9净值均T+1白天已出）
+        T0_CATEGORIES = {'国内LOF', '指数LOF', '国内指数', 'QDII亚洲', 'QDII日本'}
+        NAV_CUTOFF_HOUR = 15
+
+        def get_prev_trading_day(dt, n=1):
+            t = dt.date() - timedelta(days=n)
+            while not is_trading_day('A_SHARE', t):
+                t -= timedelta(days=1)
+            return t
+
+        t_1 = get_prev_trading_day(bj_now)
+        t_2 = get_prev_trading_day(bj_now, n=2)
+        t_3 = get_prev_trading_day(bj_now, n=3)
+        today_bj = bj_now.strftime('%Y-%m-%d')
+        now_hour = bj_now.hour
+        if category in T2_CATEGORIES:
+            return (t_1 if now_hour >= NAV_CUTOFF_HOUR else t_2).strftime('%Y-%m-%d')
+        if category in T0_CATEGORIES:
+            return (today_bj if now_hour >= NAV_CUTOFF_HOUR else t_1.strftime('%Y-%m-%d'))
+        return t_1.strftime('%Y-%m-%d')
+
+    def _db_max_nav_date(self, code):
+        conn = self.db._get_conn()
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT MAX(date) FROM unified_fund_history WHERE fund_code = ? AND nav IS NOT NULL", (code,))
+            row = cur.fetchone()
+        finally:
+            conn.close()
+        return row[0] if row and row[0] else "2000-01-01"
+
+    def _earliest_crawl_bjtime(self, category):
+        """[2026-11-10 限频] 各分类「基金公司大概率已公布净值」的北京时间最早可爬时点。
+        早于此时点爬东财多半扑空，故不爬；晚于此时点才允许（且当天至多 1 次）。"""
+        DOMESTIC = {'国内LOF', '指数LOF', '国内指数', 'QDII亚洲', 'QDII日本'}
+        QDII_T1 = {'黄金原油', 'QDII欧美'}           # 商品QDII/美股QDII，T+1，晚间公布（东哥11-10实测两者11-9均白天已出）
+        if category in DOMESTIC:
+            return (20, 0)      # 北京 20:00（A股盘后净值出齐）
+        if category in QDII_T1:
+            return (21, 0)      # 北京 21:00（QDII T+1，晚间才稳）
+        return (9, 0)           # 其余兜底：次日北京 09:00
+
+    def _fill_nav_from_eastmoney(self, codes, fund_categories, bj_now):
+        """[2026-11-10 东哥新机制·限频版] VPS主源给了陈旧值、DB仍落后时自动补位。
+        三重防空（回应东哥"不能太频繁爬东财"）：
+          ① 分时错峰——未到该分类"大概率已公布"时点绝不爬；
+          ② 每日限频——每只基金每天至多爬东财 1 次（试过未果即退避至次日）；
+          ③ 爬回校验——东财返回净值日<=DB现有视为未公布，不写库、当天退避。
+        结果：东财请求频率≈每天每基金≤1次，且多在基金公司公布后才命中，杜绝频繁/扑空。"""
+        today_bj = bj_now.strftime('%Y-%m-%d')
+        now_min = bj_now.hour * 60 + bj_now.minute
+        for code in codes:
+            if not code:
+                continue
+            category = fund_categories.get(code, '')
+            eh, em = self._earliest_crawl_bjtime(category)
+            if now_min < eh * 60 + em:
+                continue   # 未到可爬时点，静默跳过（不碰东财）
+            tried_key = f'nav_em_tried_{code}'
+            if self.db.is_access_synced_today(today_bj, tried_key):
+                continue   # 今日已试过未果，退避至明日（每天每基金≤1次）
+            expected = self._expected_nav_date(code, category, bj_now)
+            db_max = self._db_max_nav_date(code)
+            if db_max >= expected:
+                continue   # 已达标，无需爬
+            self.logger.info(f"🔍 [{code}] DB({db_max})落后预期({expected})，爬东财(限频1次/日)...")
+            try:
+                nav_df = self.hist_manager.get_nav(code, source="eastmoney")
+            except Exception as e:
+                self.logger.error(f"❌ [{code}] 东财接口异常: {e}")
+                self.db.mark_access_synced(today_bj, tried_key)
+                continue
+            if nav_df is not None and not nav_df.empty:
+                latest = nav_df['date'].max().strftime('%Y-%m-%d')
+                updated = False
+                for _, row in nav_df.iterrows():
+                    d = row['date'].strftime('%Y-%m-%d')
+                    if d > db_max:
+                        self._safe_save_fund_data(date_str=d, fund_code=code, nav=row['nav'])
+                        updated = True
+                if updated and latest >= expected:
+                    self.db.mark_access_synced(today_bj, source=f'lof_nav_{code}')
+                    self.logger.info(f"✅ [{code}] 东财补位成功，最新 {latest}")
+                else:
+                    self.db.mark_access_synced(today_bj, tried_key)
+                    self.logger.warning(f"⚠️ [{code}] 东财最新仅 {latest}，未达 {expected}，今日退避明日再试")
+            else:
+                self.db.mark_access_synced(today_bj, tried_key)
+                self.logger.warning(f"⚠️ [{code}] 东财未返回数据，今日退避")
+
     def step4_fetch_lof_market(self):
-        """[AI-2026-06-28] 步骤四：仅获取净值（收盘价已分离到 _step4_fetch_prices）"""
-        self.logger.info("=== 步骤四：抓取各基金最新净值 (东财API) ===")
-        today_str = datetime.now().strftime('%Y-%m-%d')
+        """[2026-11-10] 步骤四：净值采集 = VPS主源 + 15:00后东财自动补位。
+        VPS优先导入；对仍落后预期日期的 code，北京时间15:00后自动爬东财补齐（基金公司已公布）。
+        盘中守铁律：不提前爬东财，缺失仅报警+留空。"""
+        self.logger.info("=== 步骤四：抓取各基金最新净值 (VPS主源 + 15:00后东财自动补位) ===")
+        bj_now = datetime.utcnow() + timedelta(hours=8)
+        after_3pm = bj_now.hour >= 15
 
         # 从大一统基金列表获取所有基金代码+分类
         conn_ufl = self.db._get_conn()
@@ -1326,14 +1429,11 @@ class DailyUpdater(BaseApp):
         fund_categories = {str(r[0]): (r[1] or '') for r in all_fund_rows if r[0]}
         all_codes = list(fund_categories.keys())
 
-        # [AI-2026-10-10] VPS优先：先尝试从东京VPS拉取净值（nav_{date}.json），
-        # 全量导入后由下方 per-code expected_nav_date 检查自然跳过已补齐的 code。
+        # [AI-2026-10-10] VPS优先：先导入东京VPS净值（nav_{date}.json）
         vps_nav = self._try_sync_all_from_vps('nav')
         if vps_nav:
-            # [2026-11-09 事项3] nav 单文件是 21 天滚动窗口，历史文件不能充当「今日已覆盖」
             target_date = self._vps_expected_trade_date('nav')
             window = self._vps_coverage_window('nav', target_date)
-            vps_nav_codes = set()
             for entry in vps_nav:
                 content = entry.get('content', {})
                 for row in content.get('rows', []):
@@ -1342,89 +1442,23 @@ class DailyUpdater(BaseApp):
                     nav_v = row.get('nav')
                     if code_v and date_v and nav_v:
                         self._safe_save_fund_data(date_str=date_v, fund_code=code_v, nav=nav_v)
-                        if self._vps_row_is_fresh(date_v, window):
-                            vps_nav_codes.add(code_v)
-            if self._vps_coverage_ok('nav', vps_nav_codes, set(all_codes), target_date):
-                self.logger.info(f"✅ [VPS] 净值 {target_date} 已全覆盖 {len(vps_nav_codes)} 只，跳过本地东财")
-            # [AI-2026-10-11 东哥铁律] 部分覆盖 / 断供 → 报警 + 留空，不再本地兜底
+            self.logger.info(f"✅ [VPS] 净值已导入（目标交易日 {target_date}）；下方按DB实际进度判定是否补位")
+
+        # [2026-11-10 东哥新机制] 计算「DB净值落后预期日期」的 code（VPS给了陈旧值也算缺失）
+        missing = [c for c in all_codes
+                   if c and self._db_max_nav_date(c) < self._expected_nav_date(c, fund_categories.get(c, ''), bj_now)]
+        if not missing:
+            self.logger.info(f"✅ 全部 {len(all_codes)} 只基金净值已达预期日期（VPS/历史已覆盖），无需补位")
             return
-        # [AI-2026-10-11 东哥铁律] VPS 无今日净值 → 报警(超时) + 留空，不再本地兜底
-        self._vps_missing_alert('nav')
-        return
-        # ===== 以下为原本地兜底（东财逐 code），已按铁律禁用，保留可回退 =====
-        # [AI-2026-07-23] QDII欧美/黄金原油（美股基金）净值在北京时间上午尚未发布，
-        # 按 expected = T-2 判定，下午 3 点后才改为 T-1，避免无谓的东财抓取。
-        # [AI-2026-08-06] 国内LOF/指数LOF/QDII亚洲/QDII日本 与 A 股同日收盘、无时差，
-        # T 日净值当日可得，expected 必须设为 T 日，否则会用 T-1 净值跳过 T 日采集。
-        T2_CATEGORIES = {'黄金原油', 'QDII欧美'}
-        T0_CATEGORIES = {'国内LOF', '指数LOF', '国内指数', 'QDII亚洲', 'QDII日本'}
-        # 北京时间下午 3 点后，美股基金 T-1 净值通常已发布
-        NAV_CUTOFF_HOUR = 15
-
-        for code in all_codes:
-            if not code: continue
-            # 获取东财净值 ---
-            # [AI-2026-09-28 东哥点名修复] 原实现只跳周末、不认中国法定假日 ⇒ 9-25(中秋)
-            # 被当成交易日，expected_nav_date 落在「根本不存在的净值日」上 ⇒ 每次都判
-            # "落后于预期"、每次白抓一次东财（9-28 日志 501018 出现 498 次即此）。
-            # 改走 A股交易日历 is_trading_day('A_SHARE')（chinese_calendar 1.11 已能正确
-            # 判 2026-09-25 为假日；缺失时退 _HOLIDAYS_2026 硬编码）。保持原结构不变：
-            # 先退 n 个自然日，再回溯到最近一个交易日（周一 n=2 折叠到周五的既有语义保留）。
-            def get_prev_trading_day(dt, n=1):
-                t = dt.date() - timedelta(days=n)
-                while not is_trading_day('A_SHARE', t):
-                    t -= timedelta(days=1)
-                return t
-                
-            t_1_date = get_prev_trading_day(datetime.now())
-            t_2_date = get_prev_trading_day(datetime.now(), n=2)
-            today_str = datetime.now().strftime('%Y-%m-%d')
-            
-            # 预期最新净值日期：
-            #   QDII欧美/黄金原油：上午用 T-2，下午 3 点后用 T-1
-            #   国内LOF/指数LOF/QDII亚洲/QDII日本：与 A 股同日收盘，T 日净值当日可得
-            #   其他基金：始终 T-1
-            category = fund_categories.get(code, '')
-            now_hour = datetime.now().hour
-            if category in T2_CATEGORIES:
-                if now_hour < NAV_CUTOFF_HOUR:
-                    expected_nav_date = t_2_date.strftime('%Y-%m-%d')
-                else:
-                    expected_nav_date = t_1_date.strftime('%Y-%m-%d')
-            elif category in T0_CATEGORIES:
-                # [AI-2026-08-20] 国内LOF/QDII亚洲/日本：盘中(15:00前)净值尚未出，expected 用 T-1 避免白刷东财；盘后 >=15:00 才预期 T 日。
-                expected_nav_date = (today_str if now_hour >= NAV_CUTOFF_HOUR else t_1_date.strftime('%Y-%m-%d'))
-            else:
-                expected_nav_date = t_1_date.strftime('%Y-%m-%d')
-            
-            conn = self.db._get_conn()
-            cursor = conn.cursor()
-            cursor.execute("SELECT MAX(date) FROM unified_fund_history WHERE fund_code = ? AND nav IS NOT NULL", (code,))
-            max_nav_row = cursor.fetchone()
-            conn.close()
-            
-            db_max_nav_date = max_nav_row[0] if max_nav_row and max_nav_row[0] else "2000-01-01"
-            
-            if db_max_nav_date >= expected_nav_date:
-                nav_label = 'T-2' if category in T2_CATEGORIES else 'T-1'
-                self.logger.info(f"✅ [{code}] 数据库已有{nav_label}净值 ({db_max_nav_date})，跳过东财接口...")
-                self.db.mark_access_synced(today_str, source=f'lof_nav_{code}')
-                continue
-                
-            self.logger.info(f"🔍 [{code}] 数据库最新净值({db_max_nav_date})落后于预期进度({expected_nav_date})，前往东财获取...")
-            nav_df = self.hist_manager.get_nav(code, source="eastmoney")
-            if not nav_df.empty:
-                latest_nav_date = nav_df['date'].max().strftime('%Y-%m-%d')
-                self.logger.info(f"✅ [{code}] 获取到历史净值，最新日期: {latest_nav_date}")
-                for _, row in nav_df.iterrows():
-                    d_str = row['date'].strftime('%Y-%m-%d')
-                    self._safe_save_fund_data(date_str=d_str, fund_code=code, nav=row['nav'])
-                if latest_nav_date >= expected_nav_date:
-                    self.db.mark_access_synced(today_str, source=f'lof_nav_{code}')
-            else:
-                self.logger.warning(f"⚠️ [{code}] 东财接口未返回任何净值数据。")
-
-        # [AI-2026-06-28] 假期修复移至 _run_pipeline，nav-only 不修价格
+        if not after_3pm and not vps_nav:
+            # 盘中 + VPS整体断供：报警；其余情形交给下方 fill 按时点/限频判定
+            self._vps_missing_alert('nav')
+        # 东财补位：交由 _fill_nav_from_eastmoney 按「分类可爬时点 + 每日每基金≤1次退避」
+        # 精确控制，不再用统一 after_3pm 硬闸门（QDII次日09:00即可能早于15:00）。
+        # VPS主源已覆盖的基金不会进入 missing 列表，东财实际触发极低。
+        if missing:
+            self.logger.info(f"⏰ 进入东财补位判定：{len(missing)} 只落后基金按分类时点+限频爬取")
+            self._fill_nav_from_eastmoney(missing, fund_categories, bj_now)
 
     def step4_5_sync_fund_purchase_status(self):
         """步骤4.5：[AI-2026-08-04] 从东京VPS拉取申赎状态JSON并入库(不再本地爬akshare)
