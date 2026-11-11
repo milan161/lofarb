@@ -1801,7 +1801,7 @@ funds:
     name: 上海期货交易所主连
   sub_category: 其他
   woody_supported: false
-  data_source: silver
+  data_source: self
   related_index: ''
   valuation_method: futures
   static_valuation:
@@ -1841,7 +1841,7 @@ funds:
     name: 大连商品交易所主连
   sub_category: 其他
   woody_supported: false
-  data_source: m0
+  data_source: self
   related_index: ''
   valuation_method: futures
   static_valuation:

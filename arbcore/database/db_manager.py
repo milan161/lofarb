@@ -271,7 +271,10 @@ class DatabaseManager:
             except sqlite3.OperationalError: pass
             # [AI-2026-10-11 东哥定调] 新增 data_source 列：标记「数据源 / 估值办法」——
             #   'woody' = 采用 woody 估值办法、需从 woody API 取 position/hedge 等因子；
-            #   'm0' / 'silver' / ''（空）等 = 非 woody（商品期货 / 程序自算指数估值）。
+            #   'self'  = 用本项目自己的估值算法、不用 WOODY（东哥 2026-11-11 定义，权威 → 000_3 §7.15.7）；
+            #             商品期货自算基金（161226 白银 AG0 / 159985 豆粕 M0，step12 硬编码）均归此类。
+            #   ''（空）= 未标注的历史遗留；代码只判 'woody'，其余值一律等价「非 woody」。
+            #   ⚠️ 旧注释举例的 'm0' / 'silver' 是期货品种标签，放本列属语义错位，11-11 已统一 'self'。
             #   该信息原先只存 lof_config.yaml 的 data_source 字段，step1 抓取范围据此筛选；
             #   DB 权威化后，抓取范围改读本列（YAML 仅退化兜底），与 step5 的 symbol_master 同源手法。
             try: conn.execute("ALTER TABLE unified_fund_list ADD COLUMN data_source TEXT DEFAULT ''")
@@ -436,6 +439,9 @@ class DatabaseManager:
     def upsert_usa_etf_price(self, *args, **kwargs): return self.market.upsert_usa_etf_price(*args, **kwargs)
     def upsert_usa_etf_netvalue(self, *args, **kwargs): return self.market.upsert_usa_etf_netvalue(*args, **kwargs)
     def upsert_index_history(self, *args, **kwargs): return self.market.upsert_index_history(*args, **kwargs)
+    # [AI-2026-11-11] step5 批量落库（单事务，替代逐行 upsert）
+    def bulk_upsert_usa_etf_prices(self, *args, **kwargs): return self.market.bulk_upsert_usa_etf_prices(*args, **kwargs)
+    def bulk_upsert_index_history(self, *args, **kwargs): return self.market.bulk_upsert_index_history(*args, **kwargs)
 
     def get_latest_usa_etf_date(self, *args, **kwargs): return self.market.get_latest_usa_etf_date(*args, **kwargs)
     def get_latest_futures_price(self, *args, **kwargs): return self.market.get_latest_futures_price(*args, **kwargs)

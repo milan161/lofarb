@@ -79,6 +79,49 @@ class MarketManager(BaseManager):
             conn.commit()
             conn.close()
 
+    # 🔴 [AI-2026-11-11 东哥拍板] 单事务批量写：替代 step5 的逐行 upsert。
+    # 旧路径每份 VPS 文件 18.9 万行 × 每行 _get_conn/UPDATE/INSERT/commit/close = 38 万次
+    # 独立事务，ARM 1 OCPU 单次 step5 耗 62 分钟。改后全部行在**一个连接、一个事务**里完成。
+    def bulk_upsert_usa_etf_prices(self, rows):
+        """rows: [(date, symbol, price), ...]，依赖 PRIMARY KEY (date, symbol)。
+
+        语义与 upsert_usa_etf_price(..., netvalue=None) 完全一致：
+        冲突只更新 price + updated_at，**绝不触碰 netvalue**（净值由另一条 VPS 链路写入）。
+        返回写入行数。
+        """
+        if not rows:
+            return 0
+        with self.lock:
+            conn = self._get_conn()
+            try:
+                conn.executemany(
+                    "INSERT INTO usa_etf_daily_prices (date, symbol, price) VALUES (?, ?, ?) "
+                    "ON CONFLICT(date, symbol) DO UPDATE SET "
+                    " price = excluded.price, "
+                    " updated_at = (datetime('now', 'localtime'))",
+                    rows,
+                )
+                conn.commit()
+            finally:
+                conn.close()
+        return len(rows)
+
+    def bulk_upsert_index_history(self, rows, source: str = 'yahoo_vps'):
+        """rows: [(symbol, date, close), ...]，与 upsert_index_history 同语句，单事务。"""
+        if not rows:
+            return 0
+        with self.lock:
+            conn = self._get_conn()
+            try:
+                conn.executemany(
+                    "INSERT OR REPLACE INTO index_history (symbol, date, close, source) VALUES (?, ?, ?, ?)",
+                    [(s, d, c, source) for s, d, c in rows],
+                )
+                conn.commit()
+            finally:
+                conn.close()
+        return len(rows)
+
     # [AI-2026-07-20] VPS Yahoo 同步用：写入指数收盘价到 index_history
     def upsert_index_history(self, symbol: str, date: str, close: float, source: str = 'yahoo_vps'):
         with self.lock:

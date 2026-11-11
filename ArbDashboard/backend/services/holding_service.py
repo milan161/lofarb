@@ -1993,11 +1993,11 @@ class HoldingService:
         )
         tmp = None
         try:
-            with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False) as f:
+            with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False, encoding="utf-8") as f:
                 f.write(remote_script)
                 tmp = f.name
             cmd = 'ssh -o ConnectTimeout=8 -o StrictHostKeyChecking=no -o BatchMode=yes arm "python3 -"'
-            proc = subprocess.run(cmd, shell=True, stdin=open(tmp, "r"),
+            proc = subprocess.run(cmd, shell=True, stdin=open(tmp, "r", encoding="utf-8"),
                                   capture_output=True, encoding="utf-8", errors="replace", timeout=60)
             if proc.returncode != 0:
                 return {"status": "error",
@@ -2334,11 +2334,11 @@ print(json.dumps({'updated': len(rows), 'total': tot[0], 'max_date': tot[1]}))
         )
         tmp = None
         try:
-            with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False) as f:
+            with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False, encoding="utf-8") as f:
                 f.write(remote_script)
                 tmp = f.name
             cmd = 'ssh -o ConnectTimeout=8 -o StrictHostKeyChecking=no -o BatchMode=yes arm "python3 -"'
-            proc = subprocess.run(cmd, shell=True, stdin=open(tmp, "r"),
+            proc = subprocess.run(cmd, shell=True, stdin=open(tmp, "r", encoding="utf-8"),
                                   capture_output=True, encoding="utf-8", errors="replace", timeout=30)
             if proc.returncode != 0:
                 return {"status": "error",
@@ -2493,11 +2493,11 @@ print(json.dumps({'updated': n}))
 """ % payload
         tmp = None
         try:
-            with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False) as f:
+            with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False, encoding="utf-8") as f:
                 f.write(remote_script)
                 tmp = f.name
             cmd = 'ssh -o ConnectTimeout=8 -o StrictHostKeyChecking=no -o BatchMode=yes arm "python3 -"'
-            proc = subprocess.run(cmd, shell=True, stdin=open(tmp, "r"),
+            proc = subprocess.run(cmd, shell=True, stdin=open(tmp, "r", encoding="utf-8"),
                                   capture_output=True, encoding="utf-8", errors="replace", timeout=30)
             if proc.returncode != 0:
                 return {"status": "error",

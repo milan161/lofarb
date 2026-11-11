@@ -128,6 +128,23 @@ class DynamicValuationCalculator:
                         ri = str(ri_df.iloc[0]['related_index'] or '').strip()
                         if ri and ri != '-' and ri != '0' and ri != 'nan':
                             sym_list = [ri]
+                # [AI-2026-11-11 东哥拍板「乙·只消噪」] 只消噪，不动估值口径、不改任何估值数值。
+                # `znb_*` 是 woody 自造的「现货指数内部代号」（003_1 §127：非期货、非可交易标的，
+                # 前缀沿用新浪全球指数行情符号），后缀为标的指数：NKY/TPX/DAX/CAC/SENSEX。
+                # 它**不是美股 ETF**，永远不可能出现在 usa_etf_daily_prices 里 ⇒
+                # 本块原本每轮必然 etf_count=0 → 打 1 条 ⏭️ INFO → 回溯 SQL 恒空 → base_date 不变。
+                # 结论：这块校验对纯 znb_* 篮子是恒等 no-op，只产生噪音日志 + 白跑 2 段 SQL/轮。
+                # 按「符号性质」识别并跳过（不是按基金代码加白名单打补丁）：
+                #   · 不打 INFO 日志、不跑 COUNT/回溯 SQL；
+                #   · base_date 保持原值 ⇒ 与跳过前**结果完全一致**，估值口径零变更。
+                # 边界：篮子含真实 ETF（XOP/GLD/USO...）时不触发，原逻辑照常执行。
+                if sym_list and all(str(s).startswith('znb_') for s in sym_list):
+                    logger.debug(
+                        f"  [{fund_code}] 篮子为纯 znb_* 合成指数代号({','.join(map(str, sym_list))})，"
+                        f"非美股ETF，跳过美股ETF基准日校验（设计内预期，非数据缺失）"
+                    )
+                    sym_list = []
+
                 if sym_list:
                     placeholders = ','.join('?' for _ in sym_list)
                     etf_count = conn.execute(

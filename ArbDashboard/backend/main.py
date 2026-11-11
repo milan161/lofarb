@@ -596,16 +596,18 @@ async def lifespan(app: FastAPI):
                 return _popen_script_once([pe, sp] + args_list, sd, "daily_updater.py")
             return False
 
-        # 6. [V9.0] 9:20 清晨自动刷新 Woody/汇率/VPS
-        # [AI-2026-08-02] 触发时刻可配：ARB_MORNING_REFRESH_AT="HH:MM"，默认 09:20。
-        # 场景：ARM 展示副本只从东京 VPS 读现成产物，必须等东京自己的采集任务（约 08:30/09:20）
-        #      全部落盘之后再去拉，否则会拉到半成品。故 ARM 上设 09:35。
-        _mr_at = os.environ.get('ARB_MORNING_REFRESH_AT', '09:20')
+        # 6. [V9.0] 9:30 清晨自动刷新 Woody/汇率/VPS
+        # [AI-2026-08-02] 触发时刻可配：ARB_MORNING_REFRESH_AT="HH:MM"。
+        # [AI-2026-11-11 东哥拍板] 默认 09:20 → **09:30**，与 ARM systemd 的 09:30 对齐。
+        # 时序链：VPS woody 09:20 产出 → ARM 影子 09:25 兜底 → 两端清晨刷新 09:30 接力
+        #        （ARM 展示副本只从东京 VPS 读现成产物，必须等 VPS 全部落盘再去拉，
+        #         否则会拉到半成品）；ARM 健康检查 09:40，本机计划任务 10:00。
+        _mr_at = os.environ.get('ARB_MORNING_REFRESH_AT', '09:30')
         try:
             _MR_H, _MR_M = (int(x) for x in _mr_at.split(':'))
         except Exception:
-            logger.warning(f"⚠️ [清晨刷新] ARB_MORNING_REFRESH_AT='{_mr_at}' 格式错误，回退 09:20")
-            _MR_H, _MR_M = 9, 20
+            logger.warning(f"⚠️ [清晨刷新] ARB_MORNING_REFRESH_AT='{_mr_at}' 格式错误，回退 09:30")
+            _MR_H, _MR_M = 9, 30
 
         global _morning_refreshed_today, _morning_refresh_time
         async def morning_refresh_scheduler():
@@ -639,7 +641,7 @@ async def lifespan(app: FastAPI):
 
         # [AI-2026-08-02] 总开关：设 ARB_NO_DAILY_UPDATER=1 可完全不注册清晨刷新定时器。
         # 用途：某个部署副本不需要自己触发 daily_updater（例如纯展示副本、或由外部 cron 统一调度）。
-        # 注意：ARM 已配通东京 VPS 后，9:20 清晨刷新是其静态因子的唯一自动更新入口，
+        # 注意：ARM 已配通东京 VPS 后，09:30 清晨刷新是其静态因子的唯一自动更新入口，
         #      在 ARM 上开启此开关会让静态数据重新变死，请谨慎。
         if os.environ.get('ARB_NO_DAILY_UPDATER', '0') == '1':
             logger.info("⏸️ [清晨刷新] 已被 ARB_NO_DAILY_UPDATER=1 禁用，定时器未注册")
@@ -1244,6 +1246,36 @@ try:
         _st = max(_st_times) if _st_times else None
         out["vps_sync_date"] = _st[:10] if _st else None
         out["vps_sync_time"] = _st[11:] if (_st and len(_st) > 10) else None
+        # [AI-2026-11-11 东哥拍板] 两端估值对齐三层判据（唯一手册 000_3 §7.15）。
+        #   ① 配置签名 = unified_fund_list 关键列 hash（根因层：两端 52/52 只曾系统性漂移）
+        #   ② 代码集合 = 最新估值日两端各有哪些 fund_code（症状层：能定位差哪只）
+        #   ③ 行数/日期 = COUNT(*) + MAX(date)
+        # 纯只读，绝不写库；派生值不搬运，本机计算能力保留（下单时刻估值必须本地算）。
+        # ⚠️ 与 _build_freshness_report() 内同名块必须逐字同步，否则 H5 缺键 ⇒ 前端误判「部分缺失」。
+        import hashlib
+        out["holding_static_val"] = mx("SELECT MAX(date) FROM unified_fund_history WHERE holding_static_val IS NOT NULL")
+        def _coverage(col, d):
+            if not d:
+                return 0, []
+            try:
+                cur.execute("SELECT COUNT(*), GROUP_CONCAT(fund_code) FROM unified_fund_history "
+                            "WHERE date=? AND %s IS NOT NULL" % col, (d,))
+                r = cur.fetchone()
+                codes = sorted(x for x in (r[1] or "").split(",") if x) if r else []
+                return (r[0] if r else 0), codes
+            except Exception:
+                return 0, []
+        out["static_val_count"], out["static_val_codes"] = _coverage("static_val", out.get("static_val"))
+        out["hsv_count"], out["hsv_codes"] = _coverage("holding_static_val", out.get("holding_static_val"))
+        try:
+            cur.execute("SELECT fund_code, category, related_index, pos_ratio, data_source, paused, idx_code "
+                        "FROM unified_fund_list ORDER BY fund_code")
+            _fl = [[("" if v is None else str(v)) for v in row] for row in cur.fetchall()]
+            out["fund_list_count"] = len(_fl)
+            out["fund_list_sig"] = hashlib.sha256(json.dumps(_fl, ensure_ascii=False).encode("utf-8")).hexdigest()[:12]
+        except Exception:
+            out["fund_list_count"] = None
+            out["fund_list_sig"] = None
         con.close()
 except Exception as e:
     out["_error"] = str(e)
@@ -1303,6 +1335,36 @@ def _build_freshness_report(db_path: str) -> dict:
         _st = max(_st_times) if _st_times else None
         out["vps_sync_date"] = _st[:10] if _st else None
         out["vps_sync_time"] = _st[11:] if (_st and len(_st) > 10) else None
+        # [AI-2026-11-11 东哥拍板] 两端估值对齐三层判据（唯一手册 000_3 §7.15）。
+        #   ① 配置签名 = unified_fund_list 关键列 hash（根因层：两端 52/52 只曾系统性漂移）
+        #   ② 代码集合 = 最新估值日两端各有哪些 fund_code（症状层：能定位差哪只）
+        #   ③ 行数/日期 = COUNT(*) + MAX(date)
+        # 纯只读，绝不写库；派生值不搬运，本机计算能力保留（下单时刻估值必须本地算）。
+        # ⚠️ 与 _REMOTE_FRESHNESS_SCRIPT 内同名块必须逐字同步，否则 H5 缺键 ⇒ 前端误判「部分缺失」。
+        import hashlib
+        out["holding_static_val"] = mx("SELECT MAX(date) FROM unified_fund_history WHERE holding_static_val IS NOT NULL")
+        def _coverage(col, d):
+            if not d:
+                return 0, []
+            try:
+                cur.execute("SELECT COUNT(*), GROUP_CONCAT(fund_code) FROM unified_fund_history "
+                            "WHERE date=? AND %s IS NOT NULL" % col, (d,))
+                r = cur.fetchone()
+                codes = sorted(x for x in (r[1] or "").split(",") if x) if r else []
+                return (r[0] if r else 0), codes
+            except Exception:
+                return 0, []
+        out["static_val_count"], out["static_val_codes"] = _coverage("static_val", out.get("static_val"))
+        out["hsv_count"], out["hsv_codes"] = _coverage("holding_static_val", out.get("holding_static_val"))
+        try:
+            cur.execute("SELECT fund_code, category, related_index, pos_ratio, data_source, paused, idx_code "
+                        "FROM unified_fund_list ORDER BY fund_code")
+            _fl = [[("" if v is None else str(v)) for v in row] for row in cur.fetchall()]
+            out["fund_list_count"] = len(_fl)
+            out["fund_list_sig"] = hashlib.sha256(json.dumps(_fl, ensure_ascii=False).encode("utf-8")).hexdigest()[:12]
+        except Exception:
+            out["fund_list_count"] = None
+            out["fund_list_sig"] = None
         con.close()
     except Exception as e:
         out["_error"] = str(e)
@@ -1310,15 +1372,21 @@ def _build_freshness_report(db_path: str) -> dict:
 
 
 def _fetch_h5_report_via_ssh() -> tuple:
-    """通过 ssh arm 查询 ARM(H5) 库。返回 (report_dict_or_None, error_or_None)。"""
-    import tempfile
-    tmp = None
+    """通过 ssh arm 查询 ARM(H5) 库。返回 (report_dict_or_None, error_or_None)。
+
+    [AI-2026-11-11 根因修复] 原实现把 _REMOTE_FRESHNESS_SCRIPT 先写进
+    tempfile.NamedTemporaryFile("w")、再 stdin=open(tmp, "r") 喂给 ssh。中文 Windows 下
+    "w" 按系统 locale(GBK) 编码：脚本注释含 '⇒'(U+21D2) 时**写文件这一步就抛**
+    UnicodeEncodeError ⇒ h5 恒为 null ⇒ 后台维护整列显「部分缺失」，而 ARM 数据其实一条没缺
+    （接口 h5_error 里正是那条 GBK 报错）。读侧 open(tmp,"r") 同样按 GBK 解码，是第二个隐患。
+
+    第一性原理：脚本本就该以 UTF-8 字节流直接进 ssh stdin，落临时文件是多余环节。
+    改为 input=<str> + encoding="utf-8"（subprocess 按该编码写 stdin），与本文件
+    _arm_api_via_ssh() 已验证过的正确做法一致；同时不再留临时文件。
+    """
     try:
-        with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False) as f:
-            f.write(_REMOTE_FRESHNESS_SCRIPT)
-            tmp = f.name
         cmd = 'ssh -o ConnectTimeout=8 -o StrictHostKeyChecking=no -o BatchMode=yes arm "python3 -"'
-        proc = subprocess.run(cmd, shell=True, stdin=open(tmp, "r"),
+        proc = subprocess.run(cmd, shell=True, input=_REMOTE_FRESHNESS_SCRIPT,
                               capture_output=True, encoding="utf-8", errors="replace", timeout=25)
         if proc.returncode == 0 and (proc.stdout or "").strip():
             return json.loads((proc.stdout or "").strip().splitlines()[-1]), None
@@ -1327,12 +1395,6 @@ def _fetch_h5_report_via_ssh() -> tuple:
         return None, "SSH 超时（arm 不可达 / 网络中断 / 不在可访问 arm 的网络）"
     except Exception as e:
         return None, str(e)[:400]
-    finally:
-        if tmp and os.path.exists(tmp):
-            try:
-                os.unlink(tmp)
-            except Exception:
-                pass
 
 
 def _arm_api_via_ssh(method: str, path: str, query: dict = None, json_body: dict = None, timeout: int = 60) -> dict:
@@ -1411,7 +1473,41 @@ async def get_maintenance_report():
     """后台维护：本地 vs H5(ARM) 各数据源最新日期 + 程序健康。供前端「后台维护」页使用。"""
     try:
         local = _build_freshness_report(root_db_path)
-        h5, h5_error = await asyncio.to_thread(_fetch_h5_report_via_ssh)
+        if _is_arm():
+            # [AI-2026-11-11 东哥拍板] ARM 自身即 H5 权威源。原实现无条件 ssh arm，在 ARM 上
+            # 会连自己（arm 只是本机 Windows ~/.ssh/config 别名，ARM 无此解析）⇒ h5=null ⇒
+            # 维护页整列「部分缺失」。此时 local 与 h5 本就是同一个库，直接复用，不再发 SSH。
+            h5, h5_error = dict(local), None
+        else:
+            h5, h5_error = await asyncio.to_thread(_fetch_h5_report_via_ssh)
+        # [AI-2026-11-11 东哥拍板] 两端估值「对齐机制」：不再只看 MAX(date)。
+        # static_val 两端各算一遍是设计（本机下单时刻必须能本地算），不能靠搬值抹平差异；
+        # 收敛 = 让差异可见、可定位到具体基金、并能追到配置根因。
+        #   static_val / holding_static_val 各自按「最新估值日的基金代码集合」比差集，
+        #   清单配置按签名比对；任何一侧缺数据都只报差异，绝不补默认值。
+        alignment = None
+        if h5:
+            def _diff(a, b):
+                sa, sb = set(a or []), set(b or [])
+                return sorted(sa - sb), sorted(sb - sa)
+            _sv_l, _sv_h = _diff(local.get("static_val_codes"), h5.get("static_val_codes"))
+            _hsv_l, _hsv_h = _diff(local.get("hsv_codes"), h5.get("hsv_codes"))
+            alignment = {
+                "fund_list": ("一致" if local.get("fund_list_sig")
+                              and local.get("fund_list_sig") == h5.get("fund_list_sig") else "漂移"),
+                "fund_list_count_local": local.get("fund_list_count"),
+                "fund_list_count_h5": h5.get("fund_list_count"),
+                "static_val": {
+                    "local_count": local.get("static_val_count", 0),
+                    "h5_count": h5.get("static_val_count", 0),
+                    "local_only": _sv_l, "h5_only": _sv_h,
+                },
+                "hsv": {
+                    "local_count": local.get("hsv_count", 0),
+                    "h5_count": h5.get("hsv_count", 0),
+                    "local_only": _hsv_l, "h5_only": _hsv_h,
+                },
+            }
         return {
             "status": "ok",
             "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -1421,6 +1517,7 @@ async def get_maintenance_report():
             "local": local,
             "h5": h5,
             "h5_error": h5_error,
+            "alignment": alignment,
         }
     except Exception as e:
         return JSONResponse(status_code=500, content={"status": "error", "message": str(e)})

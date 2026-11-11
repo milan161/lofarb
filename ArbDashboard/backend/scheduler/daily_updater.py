@@ -46,6 +46,13 @@ except Exception:
     except Exception:
         _send_alert = None
 
+# 🔴 [AI-2026-11-11 东哥拍板] 行情历史保留下界：2026-01-01 起，更早的数据一律不写库。
+# 与 VPS 采集器 deploy/core/US_ETFIndex_sina.py 的 MIN_KEEP_DATE **必须同源一致**。
+# 背景：VPS 曾产全历史快照（1999/2004 起约 18.9 万行/份、16MB），step5 逐行独立事务重灌，
+#       ARM 单核单次 step5 耗 62 分钟。东哥原话：「只保留 2026 年 1.1 以来的数据」。
+# 双保险：源头已过滤，本处仍过滤（老缓存文件 / 未部署新采集器的 VPS 也不会污染 DB）。
+MIN_MARKET_DATE = "2026-01-01"
+
 # [AI-2026-10-11 东哥要求] 各 VPS 数据源的**预期产出时刻**（北京时间；对齐 deploy_vps.py 的 crontab）。
 # 用途：`_try_sync_all_from_vps` 判为 NO_TODAY 时，据此提示"是正常时滞还是已超时"。
 VPS_EXPECTED_TIME = {
@@ -1608,20 +1615,38 @@ class DailyUpdater(BaseApp):
         if vps_usa:
             # [2026-11-09 事项3] usa_prices 单文件是 48 标的全历史（18 万行），
             # 旧判据必被旧文件凑满 ⇒ 覆盖率只认新鲜窗口内的行。
+            # 🔴 [AI-2026-11-11 东哥拍板] 双保险过滤 + (date,symbol) 去重 + 单事务批量写：
+            #   源头 VPS 采集器已只产 >=MIN_KEEP_DATE 的行，但本地 10 天缓存里可能仍残留
+            #   旧格式全历史文件；此处一律丢弃。多份文件同一键只留遍历到最后（文件名日期最新）的收盘价。
+            #   原逐行 upsert = 38 万次独立事务 / ARM 62 分钟，现为 1 次事务 / 秒级。
             target_date = self._vps_expected_trade_date('usa_prices')
             window = self._vps_coverage_window('usa_prices', target_date)
+            usa_map, index_map = {}, {}
+            dropped_old = 0
             for entry in vps_usa:
                 content = entry.get('content', {})
                 for row in content.get('rows', []):
                     sym_v = str(row.get('symbol', ''))
-                    date_v = row.get('date', '')
+                    date_v = str(row.get('date', ''))[:10]
                     close_v = row.get('close')
+                    if date_v and date_v < MIN_MARKET_DATE:
+                        dropped_old += 1
+                        continue
                     if sym_v and date_v and close_v and close_v > 0:
-                        self.db.upsert_usa_etf_price(date=date_v, symbol=sym_v, price=float(close_v))
+                        px = float(close_v)
+                        usa_map[(date_v, sym_v)] = px
                         if sym_v in index_write_syms:
-                            self.db.upsert_index_history(symbol=sym_v, date=date_v, close=float(close_v))
-                        if self._vps_row_is_fresh(str(date_v)[:10], window):
+                            index_map[(sym_v, date_v)] = px
+                        if self._vps_row_is_fresh(date_v, window):
                             vps_usa_covered.add(sym_v)
+            usa_rows = [(d, s, p) for (d, s), p in usa_map.items()]
+            index_rows = [(s, d, p) for (s, d), p in index_map.items()]
+            n_usa = self.db.bulk_upsert_usa_etf_prices(usa_rows)
+            n_index = self.db.bulk_upsert_index_history(index_rows)
+            self.logger.info(
+                f"✅ [VPS] 美股/指数日线批量落库 {len(vps_usa)} 份文件: "
+                f"usa={n_usa} 行, index={n_index} 行, 丢弃 <{MIN_MARKET_DATE} 历史 {dropped_old} 行"
+            )
             if self._vps_coverage_ok('usa_prices', vps_usa_covered, set(symbols), target_date):
                 self.logger.info(f"✅ [VPS] 美股/指数日线 {target_date} 已全覆盖 {len(vps_usa_covered)} 只，跳过本地")
             # [AI-2026-10-11 东哥铁律] 部分覆盖 / 断供 → 报警 + 留空，不再本地兜底
