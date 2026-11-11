@@ -628,6 +628,12 @@ async def lifespan(app: FastAPI):
                     system_status.add_milestone("INFO", f"⏰ {_MR_H:02d}:{_MR_M:02d} 自动清晨数据刷新")
                     if _run_daily_updater(["--refresh-morning"]):
                         logger.info("✅ [清晨刷新] 已启动 --refresh-morning")
+                    elif _is_script_running("daily_updater.py"):
+                        # [AI-2026-11-11 东哥] _popen_script_once 对「已在运行，防重跳过」也返回 False，
+                        # 旧文案一律打成「启动失败」WARNING ⇒ 正常防重被误读成故障
+                        # （11-11 16:50 实测：开机时 011 已在跑，16:50 定时器补触发被挡）。
+                        # 区分这两种 False，真失败仍报 WARNING。
+                        logger.info("ℹ️ [清晨刷新] daily_updater 已在运行，跳过重复启动（非失败）")
                     else:
                         logger.warning("⚠️ [清晨刷新] 启动失败")
 
@@ -669,8 +675,11 @@ async def lifespan(app: FastAPI):
                             _nav_last_updated["time"] = now.strftime("%H:%M")
                             _nav_last_updated["date"] = today
                             logger.info(f"✅ [自动净值更新] 定时 {slot} 已启动 --nav-only")
+                        elif _is_script_running("daily_updater.py"):
+                            # [AI-2026-11-11] 同「清晨刷新」：防重跳过不是失败，别打 WARNING。
+                            logger.info("ℹ️ [自动净值更新] daily_updater 已在运行，跳过重复启动（非失败）")
                         else:
-                            logger.warning(f"⚠️ [自动净值更新] 启动失败")
+                            logger.warning("⚠️ [自动净值更新] 启动失败")
         
         asyncio.create_task(nav_update_scheduler())
         logger.info("⏰ [自动净值更新] 定时器已注册 (18:00 / 19:30 / 21:00)")
