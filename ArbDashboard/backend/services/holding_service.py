@@ -1310,8 +1310,13 @@ class HoldingService:
     # ------------------------------------------------------------------
     # 持仓实时估值（Model B）：季报持仓法 + CL 期货实时价
     # ------------------------------------------------------------------
-    def get_realtime_valuation(self, fund_code: str) -> Dict[str, Any]:
+    def get_realtime_valuation(self, fund_code: str, cl_fetcher=None) -> Dict[str, Any]:
         """持仓实时估值（Model B）—— 有效近月±1 三合约对比版。
+
+        cl_fetcher: 可选取价函数 (contract) -> (price, quote_time)。**仅 H5 只读看板
+        `/api/oil_rt` 注入带 10s TTL 的共享取价器**，让三只原油基金复用同一次 CL 现价抓取。
+        默认 None = 每个合约实时直抓新浪，单基金实时端点 / 交易 / 账本估值行为完全不变
+        （🔴 东哥铁律：下单时刻估值必须用当时可见价，绝不能被看板缓存污染）。
 
         公式：est_now = base_nav * (1 + Σ (w_i/100) * (CL_now / CL_point_i - 1))
         自 2026-09-15 起同时计算多个合约（近月 +1，如 9 月 → 2611/2612）的估值：
@@ -1458,7 +1463,8 @@ class HoldingService:
         for contract in compute_contracts:
             contracts[contract] = self._value_one_contract(
                 fund_code, contract, base_date, base_nav, per, basket,
-                fx_point, fx_now, lof_price, lof_price_source, today)
+                fx_point, fx_now, lof_price, lof_price_source, today,
+                cl_fetcher=cl_fetcher)
 
         any_ok = any(c["status"] == "ok" for c in contracts.values())
         all_ok = all(c["status"] == "ok" for c in contracts.values())
@@ -1475,7 +1481,8 @@ class HoldingService:
         }
 
     def _value_one_contract(self, fund_code, contract, base_date, base_nav, per, basket,
-                           fx_point, fx_now, lof_price, lof_price_source, today) -> Dict[str, Any]:
+                           fx_point, fx_now, lof_price, lof_price_source, today,
+                           cl_fetcher=None) -> Dict[str, Any]:
         """对单个合约（如 '2610' 近月 / '2611' +1 / '2612' +2）计算完整估值。
 
         分母取本地 futures_freeze_prices 中 symbol='CL{contract}' 的冻结价；
@@ -1514,9 +1521,12 @@ class HoldingService:
                         f"/api/fund/sync-freeze 从 ARM 拉取",
             )
 
-        # 分子：实时抓该合约 CL（A 股盘中）
+        # 分子：实时抓该合约 CL（A 股盘中）。
+        # [AI-2026-11-12 东哥拍板 A] 仅 H5 只读看板注入共享取价器（10s TTL，三基金复用）；
+        # 未注入时仍是**每次实时直抓**，交易/账本路径零变化。抓价失败不写缓存（宁缺毋假）。
         try:
-            cl_now, cl_time = self._fetch_cl_realtime(contract)
+            _fetch = cl_fetcher or self._fetch_cl_realtime
+            cl_now, cl_time = _fetch(contract)
         except Exception as e:
             return _rt_err(fund_code, "cl_fetch_failed", base_date=base_date, contract=contract,
                           lof_price=lof_price, lof_price_source=lof_price_source,

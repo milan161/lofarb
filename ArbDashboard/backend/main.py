@@ -1716,6 +1716,36 @@ async def get_fund_hedge_exposure(code: str):
 # ARM 自算（CL/MCL 对冲口径，正确），复用 get_realtime_valuation；页面打开即调此接口现算，
 # 前端 15-30s 自动/手动刷新；无服务器定时任务（不开页面零消耗）。
 OIL_RT_FUNDS = ["160723", "161129", "501018"]
+
+# ---------------------------------------------------------------------------
+# [AI-2026-11-12 东哥拍板 A] H5 /oil 提速：CL 现价「按合约一次抓、三基金复用 + 10s TTL」
+# ---------------------------------------------------------------------------
+# 量化依据（11-12 ARM 实测）：/api/oil_rt 固定 3.1~3.3s，其中 6 次新浪 hf_CL 抓取
+# （2701/2702 × 3 只基金）单次 0.54~0.59s ≈ 3.4s ⇒ 重复抓价就是全部固定成本。
+# 口径边界（🔴 不可越界）：
+#   · 缓存**只在 H5 只读看板 /api/oil_rt 路径**生效，由调用方注入 cl_fetcher；
+#   · /api/fund/{code}/holding-realtime、ledger_service 的交易/账本估值**不注入**，
+#     仍是每次实时直抓 —— 「下单时刻估值必须用当时可见价」不受影响；
+#   · TTL 10s < 前端 15s 轮询 ⇒ 每轮至少刷新一次，CL 现价最多滞后 10s；
+#   · 抓价失败不写缓存，异常照常上抛 ⇒ status='cl_fetch_failed'，宁缺毋假。
+OIL_CL_TTL_S = 10.0
+_OIL_CL_CACHE = {}          # contract -> (monotonic_ts, (price, quote_time))
+_OIL_CL_CACHE_LOCK = threading.Lock()
+
+
+def _cl_fetch_cached(contract: str):
+    """H5 只读看板专用：同合约 10s 内复用现价，过期实时重抓（网络 IO 在锁外）。"""
+    now = time.monotonic()
+    with _OIL_CL_CACHE_LOCK:
+        hit = _OIL_CL_CACHE.get(contract)
+        if hit and now - hit[0] < OIL_CL_TTL_S:
+            return hit[1]
+    price_time = holding_service._fetch_cl_realtime(contract)
+    with _OIL_CL_CACHE_LOCK:
+        _OIL_CL_CACHE[contract] = (time.monotonic(), price_time)
+    return price_time
+
+
 # [AI-2026-09-24] 删除硬编码 OIL_RT_NAMES：原字典三个名称全部写错
 # （160723 误作"南方原油"、161129 误作"国泰商品"、501018 误作"南方原油LOF"），
 # 且与 DB 权威表 unified_fund_list 构成双重真相源（东哥铁律：DB 唯一权威、绝不兜底）。
@@ -1810,18 +1840,19 @@ def _collect_oil_rt_funds():
     """[同步·阻塞] 逐只原油基金算 Model B，组装 H5 页精简结构；返回 (funds, overall_ok)。
 
     ⚠️ 只允许被**同步 def** 端点 /api/oil_rt 调用：get_realtime_valuation 内部是**同步**
-    urlopen 抓 CL 实时价（timeout=8 × 最多 3 次重试 + 退避 0.9s ⇒ 单合约最坏 24.9s；
-    compute_contracts = WTI 近月±1 + Brent 书月份，最坏 4 个合约 ⇒ 单基金最坏 ≈100s，
-    三基金串行最坏 ≈300s）。若改回 async def 直接调用，这段阻塞会压在单 worker 事件循环上，
-    期间**所有接口全部无响应**（9-30 实测：主看板轮询 + 持仓静态估值全部排队，watchdog
-    卡顿 91→151→211s 单调递增直至死锁）。FastAPI 对非 async 端点自动丢线程池 ⇒ 一行治好。
+    urlopen 抓 CL 实时价（timeout=8 × 最多 3 次重试 + 退避 0.9s ⇒ 单合约最坏 24.9s）。
+    若改回 async def 直接调用，这段阻塞会压在单 worker 事件循环上，期间**所有接口全部无响应**
+    （9-30 实测：主看板轮询 + 持仓静态估值全部排队，watchdog 卡顿 91→151→211s 单调递增
+    直至死锁）。FastAPI 对非 async 端点自动丢线程池 ⇒ 一行治好。
+    [AI-2026-11-12 东哥拍板 A] 三基金统一注入 cl_fetcher=_cl_fetch_cached：同合约只抓一次、
+    10s TTL 内跨请求复用，固定成本由 6 次抓取（≈3.3s）降为 2 次（≈1.1s）/ 缓存命中 0 次。
     """
     names = _oil_fund_names(OIL_RT_FUNDS)  # [AI-2026-09-24] 名称读 DB 权威表
     funds = []
     overall_ok = True
     for code in OIL_RT_FUNDS:
         try:
-            d = holding_service.get_realtime_valuation(code)
+            d = holding_service.get_realtime_valuation(code, cl_fetcher=_cl_fetch_cached)
             if d.get("status") == "ok":
                 contracts = _simplify_oil_contracts(d.get("contracts", {}))
                 hedge_plan = _fund_hedge_plan(code)
