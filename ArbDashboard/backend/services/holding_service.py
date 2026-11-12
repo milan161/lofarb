@@ -15,6 +15,7 @@
 import re
 import sqlite3
 from datetime import datetime, timezone, timedelta
+from datetime import date as _date
 from typing import Dict, Any, List, Optional
 
 
@@ -281,36 +282,55 @@ FREEZE_POINTS = ["1130", "1430", "1600"]   # 必需：base_date 判定分母，�
 EXTRA_POINTS = ["0230"]                     # 可选增强：仅 1671/1699（日本腿）取价用
 
 
-def get_active_cl_contracts(as_of_date=None):
-    """返回当前活跃的两个 CL 合约 YYMM 列表 [近月, +1月]。
+def cl_last_trading_day(contract: str):
+    """CL(WTI) 合约最后交易日 YYYY-MM-DD（NYMEX 规则近似）。
 
-    规则（2026-09-17 东哥拍板）：底层 ETF 已滚过 2610，主连 2610 估值对对冲无意义，
-    只保留两个对冲合约。有效近月 = 当月 + 2（USO 在每月初 5-8 个工作日滚仓，
-    中下旬实际持有"次次月"合约：如 9 月 → 近月=11 月 [2611,2612]）；
-    下月自动滚动（10 月 → [2612,2701]）。
+    规则（与 deploy/roll_oil_contracts.py 注释「交割月前一月中下旬摘牌」同源）：
+    最后交易日 = 交割月**前一月** 25 日往前的第 3 个交易日。
+    例：CL2612 → 2026-11-25 前 3 个交易日 = 2026-11-20；CL2701 → 2026-12-22。
+    ⚠️ 只排周末、不排美股假日，边界误差 ≤1 个交易日（不影响「是否已到期」判定）。
     """
-    from datetime import date as _date
+    yy, mm = int(contract[:2]), int(contract[2:])
+    year, month = 2000 + yy, mm
+    if month > 1:
+        prev_y, prev_m = year, month - 1
+    else:
+        prev_y, prev_m = year - 1, 12
+    d = _date(prev_y, prev_m, 25)
+    n = 0
+    while n < 3:
+        d -= timedelta(days=1)
+        if d.weekday() < 5:
+            n += 1
+    return d
+
+
+def get_active_cl_contracts(as_of_date=None):
+    """返回「未到期」的最早两个 CL 合约 YYMM 列表。
+
+    [2026-11-12 东哥拍板] 弃用旧的 `front_m = m + 2`（当月+N 魔法数，跨年还要手工绕，
+    且 11 月会跳过 2612 直接给 2701/2702）。新规则按**实际到期日**过滤：
+    从当月+1 起往后扫，取最后交易日 > 今天的头两个合约。
+      · 2026-11-12 → [2612, 2701]（2612 于 11-20 到期）
+      · 2026-11-21 → [2701, 2702]（2612 已摘牌，自动滚走）
+    这样既贴合「东哥手上持的那个 MCL 月 + 下一个候选月」，也不会把已摘牌合约
+    送进估值（摘牌后新浪只返最后成交价，会让估值恒等 hsv 的假数据）。
+    """
     if as_of_date is None:
         as_of_date = _date.today()
+    out: List[str] = []
     y, m = as_of_date.year, as_of_date.month
-    front_m = m + 2  # 有效近月 = 当月 + 2（USO 月中已滚至次次月）
-    front_y = y
-    if front_m > 12:
-        front_m -= 12
-        front_y += 1
-
-    def _yymm(year, month):
-        return f"{year % 100:02d}{month:02d}"
-
-    contracts = []
-    for i in range(2):
-        cm = front_m + i
-        cy = front_y
-        if cm > 12:
+    for i in range(1, 9):  # 最多往后扫 8 个月，够跨两次换月
+        cm, cy = m + i, y
+        while cm > 12:
             cm -= 12
             cy += 1
-        contracts.append(_yymm(cy, cm))
-    return contracts
+        c = f"{cy % 100:02d}{cm:02d}"
+        if cl_last_trading_day(c) >= as_of_date:
+            out.append(c)
+            if len(out) == 2:
+                break
+    return out
 
 
 CL_CONTRACTS = get_active_cl_contracts()  # 模块加载时算一次（当天不变）
@@ -1401,12 +1421,39 @@ class HoldingService:
                 "WHERE variety='Brent' AND in_book=1 "
                 "AND contract_month IS NOT NULL AND contract_month != ''"
             ).fetchall()]
+            # [2026-11-12 东哥拍板] WTI 书里真实持有的合约月（敞口降序前 3）。
+            # 起因：11 月 active 规则换成「未到期最早两月」后仍是 [2612,2701]，但若某天
+            # active 与 ETF 实际持仓错位（如 10 月 USO 已滚到 2612 而 active 给 2701/2702），
+            # hedge_plan 的月份会不在 contracts 里 ⇒ _oil_mixed_valuation 返回 None ⇒
+            # H5 静默退化到「近月单档」（东哥 09-23 已否定该口径）。
+            # 计算集应由「表里真实持仓」决定，而非日期推算 —— 故并入 in_book 月份。
+            wti_exposure_months = [r[0] for r in conn.execute(
+                "SELECT contract_month, SUM(weight_pct * futures_ratio * "
+                "COALESCE(inner_ratio, 1)) AS exp "
+                "FROM etf_contract_exposure "
+                "WHERE variety='WTI' AND in_book=1 AND mcl_ok=1 "
+                "AND contract_month IS NOT NULL AND contract_month != '' "
+                "GROUP BY contract_month ORDER BY exp DESC LIMIT 3"
+            ).fetchall()]
         finally:
             conn.close()
 
         # 逐合约计算估值（分母/分子各自合约严格一致）
         # [AI-2026-09-17] 计算合约 = WTI active + Brent 书合约月（同月 CL 跨品种对冲反算）
-        compute_contracts: List[str] = list(dict.fromkeys(list(active) + brent_months))
+        # [2026-11-12] 并入 WTI 书 in_book 月份；已摘牌合约剔除（新浪对摘牌合约返最后
+        # 成交价，会让该腿 ratio=1、Model B 恒等 hsv 的假数据）。
+        _today_d = _date.today()
+
+        def _alive(m: str) -> bool:
+            try:
+                return cl_last_trading_day(m) >= _today_d
+            except Exception:
+                return False
+
+        compute_contracts: List[str] = list(dict.fromkeys(
+            list(active)
+            + [m for m in wti_exposure_months if _alive(m)]
+            + [m for m in brent_months if _alive(m)]))
         contracts: Dict[str, Any] = {}
         for contract in compute_contracts:
             contracts[contract] = self._value_one_contract(
