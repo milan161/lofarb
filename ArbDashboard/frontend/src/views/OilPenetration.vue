@@ -1,7 +1,7 @@
 <!--
   [AI-2026-10-10] 「原油穿透」三基金持仓口径页（Model B 季报持仓口径）
   - 行数据：getDashboard({ category: '黄金原油' }) 前端过滤 501018/160723/161129，约 5s 轮询
-  - 持仓口径：getFundHoldingRealtime(code) 取 { realtime_nav, base_nav }，约 20s 轮询
+  - 持仓口径：getFundHoldingRealtime(code) 取 { hrv, base_nav }，约 20s 轮询
   - SUPREME 铁律：任何字段缺失显示 --，严禁用 0/最近值兜底
   - 行点击跳 /holding-analysis?code=&name=（与 HoldingAnalysis 页对接）
 -->
@@ -60,8 +60,8 @@ type DashboardRow = {
   nav_date?: string | null
 }
 
-// 持仓口径（Model B）：realtime_nav=实时估值，base_nav=T-1静态估值
-type HoldingData = { realtime_nav: number | null; base_nav: number | null }
+// 持仓口径（Model B）：hrv=实时估值，base_nav=T-1静态估值
+type HoldingData = { hrv: number | null; base_nav: number | null }
 
 const rows = ref<DashboardRow[]>([])
 const holdingMap = ref<Record<string, HoldingData>>({})
@@ -93,7 +93,7 @@ const fetchRows = async () => {
 }
 
 // ---- 持仓口径轮询（约 20s）----
-// 端点返回 {data:{contracts:{合约:{realtime_nav, base_nav, ...}}}}，取首个合约（当前近月）
+// 端点返回 {data:{contracts:{合约:{hrv, base_nav, ...}}}}，取首个合约（当前近月）
 // 与 Dashboard.vue / HoldingAnalysis.vue 的取法对齐（读 getFundHoldingRealtime 的 data.data）
 let holdingTimer: ReturnType<typeof setInterval> | null = null
 const fetchHoldings = async () => {
@@ -106,7 +106,7 @@ const fetchHoldings = async () => {
         const c = keys.length > 0 ? d.contracts[keys[0]] : null
         // [SUPREME] 缺失就置 null（?? null），绝不用 0/最近值兜底
         holdingMap.value[code] = {
-          realtime_nav: c?.realtime_nav ?? null,
+          hrv: c?.hrv ?? null,
           base_nav: c?.base_nav ?? null
         }
       }
@@ -133,7 +133,7 @@ onUnmounted(() => {
 // [AI-2026-10-10] 东哥指令：列名/顺序/格式化/涨跌颜色/列宽与主看板完全一致，只保留到「T-1估值溢价」为止
 // （主看板右侧「成交额」起的列全部不要）。列名大体与主看板一致，但按东哥 2026-10-10 指令：
 // 估值两列加「持仓」前缀（实时估值→持仓实时估值、T-1静态估值→T-1持仓静态估值）防口径歧义，溢价列名不变；
-// 但 实时估值=T-2/实时估值 等 4 列的值仍是持仓口径（Model B：holding.realtime_nav / holding.base_nav），
+// 但 实时估值=T-2/实时估值 等 4 列的值仍是持仓口径（Model B：holding.hrv / holding.base_nav），
 // 与主看板标准估值口径不同 —— 副标题口径提示必须保留。
 // 涨跌幅列字段口径照抄主看板：有 prev_close 用 (现价-prev_close)/prev_close 实时算，否则退回行数据 price_change。
 const columns: DataTableColumns<DashboardRow> = [
@@ -195,7 +195,7 @@ const columns: DataTableColumns<DashboardRow> = [
     }
   },
   {
-    // [AI-2026-10-10] 东哥指令：列名「实时估值」→「持仓实时估值」（与主看板标准口径列区分防歧义），值 = holding.realtime_nav（Model B）
+    // [AI-2026-10-10] 东哥指令：列名「实时估值」→「持仓实时估值」（与主看板标准口径列区分防歧义），值 = holding.hrv（Model B）
     // 标题用主看板同款 col-title-wrapper 单行居中写法；缺失 → '--'；列宽 80→100 适配 6 字表头不折行
     title: () => h('div', { class: 'col-title-wrapper' }, [
       h('div', { style: 'font-size: 12px; font-weight: bold;' }, '持仓实时估值')
@@ -204,23 +204,23 @@ const columns: DataTableColumns<DashboardRow> = [
     width: 100,
     align: 'center',
     render(row) {
-      const nav = holdingMap.value[row.fund_code]?.realtime_nav
-      // [SUPREME] realtime_nav 为 null → 显示 --，绝不用 0/最近值兜底
+      const nav = holdingMap.value[row.fund_code]?.hrv
+      // [SUPREME] hrv 为 null → 显示 --，绝不用 0/最近值兜底
       return nav == null
         ? h('span', { class: 'num-cell strong' }, '--')
         : h('span', { class: 'num-cell strong' }, formatValuation(nav))
     }
   },
   {
-    // [AI-2026-10-10] 主看板列 7「实时溢价」：列名照抄主看板，值 = (现价/realtime_nav−1)×100（Model B）
+    // [AI-2026-10-10] 主看板列 7「实时溢价」：列名照抄主看板，值 = (现价/hrv−1)×100（Model B）
     title: '实时溢价',
     key: 'rt_premium',
     width: 80,
     align: 'center',
     render(row) {
-      const nav = holdingMap.value[row.fund_code]?.realtime_nav
+      const nav = holdingMap.value[row.fund_code]?.hrv
       const p = curPrice(row)
-      // [SUPREME] realtime_nav 或现价为 null → 溢价显示 --，绝不兜底
+      // [SUPREME] hrv 或现价为 null → 溢价显示 --，绝不兜底
       if (nav == null || p == null) {
         return h('span', { class: 'num-cell muted' }, '--')
       }

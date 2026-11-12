@@ -1681,7 +1681,7 @@ async def sync_oil_static_api(code: str):
 
 @app.get("/api/fund/{code}/holding-realtime")
 def get_fund_holding_realtime(code: str):
-    """基金季报持仓分析：持仓实时估值（Model B，季报持仓法 + CL 期货实时价）。
+    """基金季报持仓分析：持仓实时估值（hrv，季报持仓法 + CL 期货实时价）。
 
     [AI-2026-09-30] 刻意用同步 `def`：get_realtime_valuation 内部同步 urlopen 抓 CL 实时价
     （timeout=8 × 最多 3 次重试），写成 async 会焊死单 worker 事件循环 → 交给 FastAPI 丢线程池。
@@ -1783,7 +1783,7 @@ def _simplify_oil_contracts(contracts: dict) -> dict:
         out[k] = {
             "contract": c.get("contract"),
             "status": c.get("status"),
-            "realtime_nav": c.get("realtime_nav"),
+            "hrv": c.get("hrv"),
             "lof_price": c.get("lof_price"),
             "lof_price_source": c.get("lof_price_source"),
             "realtime_premium": c.get("realtime_premium"),
@@ -1798,7 +1798,7 @@ def _simplify_oil_contracts(contracts: dict) -> dict:
 
 
 def _oil_mixed_valuation(contracts: dict, hedge_plan: dict) -> dict | None:
-    """混合估值（WTI 动态加权）：V_mix = Σ(weights[i]% × months[i].realtime_nav)。
+    """混合估值（WTI 动态加权）：V_mix = Σ(weights[i]% × months[i].hrv)。
 
     口径与本机 HoldingAnalysis.vue 的 mixedValuation/mixedPremium 完全一致（东哥 2026-09-23 拍板上 H5）：
     仅当 hedge_plan 存在且每个月都取到估值时返回，否则 None（不兜底）。
@@ -1812,7 +1812,7 @@ def _oil_mixed_valuation(contracts: dict, hedge_plan: dict) -> dict | None:
     nav_sum, ok_all = 0.0, True
     for m, w in zip(months, weights):
         c = (contracts or {}).get(m) or {}
-        nav = c.get("realtime_nav")
+        nav = c.get("hrv")
         if nav is None:
             ok_all = False
             break
@@ -1822,7 +1822,7 @@ def _oil_mixed_valuation(contracts: dict, hedge_plan: dict) -> dict | None:
     lof_price = next(
         (c.get("lof_price") for c in (contracts or {}).values()
          if isinstance(c, dict) and c.get("lof_price")), None)
-    mix = {"months": months, "weights": weights, "realtime_nav": round(nav_sum, 4)}
+    mix = {"months": months, "weights": weights, "hrv": round(nav_sum, 4)}
     if lof_price:
         mix["realtime_premium"] = round(lof_price / nav_sum - 1, 6)
     return mix
@@ -1837,7 +1837,7 @@ def _fund_hedge_plan(fund_code: str) -> dict | None:
 
 
 def _collect_oil_rt_funds():
-    """[同步·阻塞] 逐只原油基金算 Model B，组装 H5 页精简结构；返回 (funds, overall_ok)。
+    """[同步·阻塞] 逐只原油基金算 hrv，组装 H5 页精简结构；返回 (funds, overall_ok)。
 
     ⚠️ 只允许被**同步 def** 端点 /api/oil_rt 调用：get_realtime_valuation 内部是**同步**
     urlopen 抓 CL 实时价（timeout=8 × 最多 3 次重试 + 退避 0.9s ⇒ 单合约最坏 24.9s）。

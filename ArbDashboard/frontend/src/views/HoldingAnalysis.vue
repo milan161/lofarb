@@ -157,10 +157,10 @@
               <div style="font-size: 12px; color: #64748b;">持仓实时估值</div>
               <template v-if="cSel">
                 <div style="font-size: 18px; font-weight: bold; line-height: 1.25; color: #2563eb;">
-                  {{ cSel.realtime_nav != null ? cSel.realtime_nav.toFixed(4) : '缺失' }}<span style="font-size: 11px; font-weight: normal; margin-left: 2px;">{{ contractMonthLabel(hedgeContract) }}</span>
+                  {{ cSel.hrv != null ? cSel.hrv.toFixed(4) : '缺失' }}<span style="font-size: 11px; font-weight: normal; margin-left: 2px;">{{ contractMonthLabel(hedgeContract) }}</span>
                 </div>
                 <div v-for="oc in otherContracts" :key="oc" style="font-size: 13px; font-weight: bold; line-height: 1.25; color: #94a3b8;">
-                  {{ cData(oc)?.realtime_nav != null ? cData(oc)!.realtime_nav.toFixed(4) : '-' }}<span style="font-size: 10px; font-weight: normal; margin-left: 2px;">{{ contractMonthLabel(oc) }}</span>
+                  {{ cData(oc)?.hrv != null ? cData(oc)!.hrv.toFixed(4) : '-' }}<span style="font-size: 10px; font-weight: normal; margin-left: 2px;">{{ contractMonthLabel(oc) }}</span>
                 </div>
               </template>
               <div v-else style="font-size: 18px; font-weight: bold; color: #94a3b8;">-</div>
@@ -399,7 +399,7 @@
                 <div style="font-size: 14px; font-weight: bold;">{{ cData(k)?.cl_now != null ? cData(k)!.cl_now.toFixed(3) : '-' }}</div>
                 <div style="font-size: 10px; color: #94a3b8;">{{ cData(k)?.cl_time || '' }}</div>
               </td>
-              <td style="font-size: 14px; font-weight: bold; color: #2563eb;">{{ cData(k)?.realtime_nav != null ? cData(k)!.realtime_nav.toFixed(4) : '-' }}</td>
+              <td style="font-size: 14px; font-weight: bold; color: #2563eb;">{{ cData(k)?.hrv != null ? cData(k)!.hrv.toFixed(4) : '-' }}</td>
               <td :style="{ fontSize: '14px', fontWeight: 'bold', color: cData(k)?.realtime_premium != null ? (cData(k)!.realtime_premium >= 0 ? '#dc2626' : '#16a34a') : '#1e293b' }">{{ cData(k)?.realtime_premium != null ? (cData(k)!.realtime_premium * 100).toFixed(3) + '%' : '-' }}</td>
               <td>{{ lofSharesPerLot(k) != null ? lofSharesPerLot(k)!.toLocaleString() : '-' }}</td>
               <td style="font-size: 14px; font-weight: bold; color: #16a34a;">{{ lofSharesForMclOf(k) != null ? lofSharesForMclOf(k)!.toLocaleString() : '-' }}</td>
@@ -815,23 +815,23 @@ watch(realtimeModalShow, (v) => {
 })
 
 // [AI-2026-09-15] 对冲手数 → 应买 LOF 份数：纯前端实时反算。
-// 用当刻实时估值(realtime_nav) / 选中合约 CL 实时价(cl_now) / 中间价(fx_now, usd_cny_mid) / 季报篮子 β(valid_weight_sum)。
+// 用当刻实时估值(hrv) / 选中合约 CL 实时价(cl_now) / 中间价(fx_now, usd_cny_mid) / 季报篮子 β(valid_weight_sum)。
 // 物理含义：LOF 每份油价敞口 = NAV × β(仓位)；1 张 MCL = 100 桶 WTI 敞口 = 100 × CL × fx(CNY)。
-// 对冲平衡：shares × realtime_nav × β = n × 100 × cl_now × fx → shares = n×100×cl_now×fx / (realtime_nav × β)。
+// 对冲平衡：shares × hrv × β = n × 100 × cl_now × fx → shares = n×100×cl_now×fx / (hrv × β)。
 const mclLots = ref(1)
 const lofSharesForMcl = computed(() => {
   const c = cSel.value
-  if (!c || c.realtime_nav == null || c.valid_weight_sum == null || c.valid_weight_sum <= 0) return null
+  if (!c || c.hrv == null || c.valid_weight_sum == null || c.valid_weight_sum <= 0) return null
   const cl = c.cl_now
   const fx = c.fx_now
   if (cl == null || fx == null || fx <= 0) return null
-  const shares = mclLots.value * 100 * cl * fx / (c.realtime_nav * c.valid_weight_sum)
+  const shares = mclLots.value * 100 * cl * fx / (c.hrv * c.valid_weight_sum)
   return Math.round(shares)
 })
 const lofMarketValueForMcl = computed(() => {
   const c = cSel.value
-  if (lofSharesForMcl.value == null || !c || c.realtime_nav == null) return null
-  return Math.round(lofSharesForMcl.value * c.realtime_nav)
+  if (lofSharesForMcl.value == null || !c || c.hrv == null) return null
+  return Math.round(lofSharesForMcl.value * c.hrv)
 })
 
 // [AI-2026-09-17] 全合约对比（弹窗不再单选切换）：以下函数按合约 key 直接计算，不依赖选中。
@@ -846,10 +846,10 @@ const brentMonthSet = computed(() => new Set((hedgeExposure.value?.brent?.months
 /** 每合约：N 手 MCL → 应买 LOF 份数（用当刻估值/CL/汇率/β 实时算） */
 function lofSharesForMclOf(contract: string): number | null {
   const c = cData(contract)
-  if (!c || c.realtime_nav == null || c.valid_weight_sum == null || c.valid_weight_sum <= 0) return null
+  if (!c || c.hrv == null || c.valid_weight_sum == null || c.valid_weight_sum <= 0) return null
   const cl = c.cl_now, fx = c.fx_now
   if (cl == null || fx == null || fx <= 0) return null
-  return Math.round(mclLots.value * 100 * cl * fx / (c.realtime_nav * c.valid_weight_sum))
+  return Math.round(mclLots.value * 100 * cl * fx / (c.hrv * c.valid_weight_sum))
 }
 /** 每合约：每 1 手 MCL → 应买 LOF 份数（mclLots=1，便于东哥 Excel 按任意手数乘） */
 function lofSharesPerLot(contract: string): number | null {
@@ -857,22 +857,22 @@ function lofSharesPerLot(contract: string): number | null {
 }
 /** 每 1 手 MCL → 应买 LOF 份数（任意基金/合约通用；三基金对比弹窗复用） */
 function perLotShares(c: any): number | null {
-  if (!c || c.realtime_nav == null || c.valid_weight_sum == null || c.valid_weight_sum <= 0) return null
+  if (!c || c.hrv == null || c.valid_weight_sum == null || c.valid_weight_sum <= 0) return null
   const cl = c.cl_now, fx = c.fx_now
   if (cl == null || fx == null || fx <= 0) return null
-  return Math.round(100 * cl * fx / (c.realtime_nav * c.valid_weight_sum))
+  return Math.round(100 * cl * fx / (c.hrv * c.valid_weight_sum))
 }
 
 // [AI-2026-09-21] 混合估值（WTI 动态加权）：用进阶对冲方案的真实月份占比，把 WTI 内部 2611/2612 比例误差抹平，更接近基金真实混合持仓 NAV。
-// V_mix = Σ(weights[i]% × cData(months[i]).realtime_nav)；仅当 hedge_plan 存在且每个月都能取到估值时返回，否则 null（不兜底）。
+// V_mix = Σ(weights[i]% × cData(months[i]).hrv)；仅当 hedge_plan 存在且每个月都能取到估值时返回，否则 null（不兜底）。
 const mixedValuation = computed<number | null>(() => {
   const hp = hedgeExposure.value?.hedge_plan
   if (!hp || !hp.months || !hp.weights || hp.months.length !== hp.weights.length) return null
   let sum = 0
   for (let i = 0; i < hp.months.length; i++) {
     const c = cData(hp.months[i])
-    if (!c || c.realtime_nav == null) return null
-    sum += (hp.weights[i] / 100) * c.realtime_nav
+    if (!c || c.hrv == null) return null
+    sum += (hp.weights[i] / 100) * c.hrv
   }
   return sum
 })
@@ -947,7 +947,7 @@ function cmpNet(row: any): number | null {
 // [AI-2026-09-28 东哥点名] 已删除 bestNetCode（自动标"最优"）：不做选标推荐，由东哥自行判断。
 // —— 对比弹窗展示 helper（吸收 TS 断言噪音）——
 const cmpBeta = (c: any) => c?.valid_weight_sum != null ? (c.valid_weight_sum * 100).toFixed(2) + '%' : '-'
-const cmpNav = (c: any) => c?.realtime_nav != null ? c.realtime_nav.toFixed(4) : '-'
+const cmpNav = (c: any) => c?.hrv != null ? c.hrv.toFixed(4) : '-'
 const cmpPremium = (c: any) => c?.realtime_premium != null ? (c.realtime_premium * 100).toFixed(3) + '%' : '-'
 const cmpPrice = (c: any) => c?.lof_price != null ? c.lof_price.toFixed(3) : '-'
 // [AI-2026-09-23] LOF 价格来源标签：非交易时段腾讯返回的是最近收盘价，必须区分标"昨收"/"收盘(今日)"，避免把昨收误显成实时误导决策
@@ -1019,7 +1019,7 @@ const exportCompareCsv = () => {
         'r_fx%': csvPct(c?.fx_change_pct, 6),
         'fx状态': c?.fx_status ?? '',
         '总变动%': csvPct(c?.total_change_pct, 6),
-        '实时估值': csvNum(c?.realtime_nav, 6),
+        '实时估值': csvNum(c?.hrv, 6),
         'LOF现价': csvNum(c?.lof_price, 4),
         '现价来源': lofSrcLabel(c?.lof_price_source),
         '实时持仓溢价%': csvPct(p, 6),

@@ -20,7 +20,7 @@ from typing import Dict, Any, List, Optional
 
 
 # ---------------------------------------------------------------------------
-# 季报持仓法静态估值（Model A）配置
+# 季报持仓法静态估值（hsv）配置
 # ---------------------------------------------------------------------------
 # 权重唯一权威 = DB fund_report_holdings.weight（小数存储，×100 才是百分比）。
 # 这里只保留"代码取代不了 DB"的两项元数据：
@@ -265,7 +265,8 @@ def _eastmoney_hk_daily_closes(hk_code: str) -> Dict[str, float]:
 
 
 # ---------------------------------------------------------------------------
-# 持仓实时估值（Model B）配置
+# 持仓实时估值配置（字段 hrv = **h**olding **r**ealtime **v**al，旧称 Model B；
+# 与 hsv = holding static val 只差 s/r 一个字母。2026-11-12 东哥定名，realtime_nav 已废弃）
 # ---------------------------------------------------------------------------
 # 分母 = CL(WTI) 合约月冻结价（来自 ARM futures_freeze_prices，每天上午盘前拉一次）。
 # 自 2026-09-17 起改为"两个对冲合约"：有效近月=当月+2（USO 在每月初 5-8 个工作日滚仓，
@@ -334,7 +335,7 @@ def get_active_cl_contracts(as_of_date=None):
 
 
 CL_CONTRACTS = get_active_cl_contracts()  # 模块加载时算一次（当天不变）
-# 篮子标的 -> 其确定自身净值的 NY 时点（与 Model A 口径一致）：
+# 篮子标的 -> 其确定自身净值的 NY 时点（与 hsv 口径一致）：
 #   CRUD = CME WTI 14:30 EDT；BRNT = ICE Brent 11:30 EDT（本期用 CL 带残差）；
 #   1671/1699 = TSE 收盘 15:30 JST = 02:30 EDT（东京 Simplex WTI / 野村原油多头指数，
 #               501018 日本腿共 11.04%；[2026-09-26] 补上，此前被兜底归到 1600，
@@ -592,7 +593,7 @@ class HoldingService:
         """季报持仓法实时估值。
 
         公式（简化版）：
-            realtime_nav = report_nav * (1 + Σ(weight_i * (current_price_i / base_price_i - 1)))
+            hrv = report_nav * (1 + Σ(weight_i * (current_price_i / base_price_i - 1)))
 
         说明：
         - 报告期净值来自 unified_fund_history.nav
@@ -681,10 +682,10 @@ class HoldingService:
                     "status": status,
                 })
 
-            realtime_nav = None
+            hrv = None
             realtime_available = False
             if nav is not None and valid_weight_sum > 1e-6:
-                realtime_nav = nav * (1.0 + total_contribution)
+                hrv = nav * (1.0 + total_contribution)
                 realtime_available = True
 
             return {
@@ -692,7 +693,7 @@ class HoldingService:
                 "report_period": report_period,
                 "report_date": report_date,
                 "report_nav": nav,
-                "realtime_nav": realtime_nav,
+                "hrv": hrv,
                 "realtime_available": realtime_available,
                 "total_change_pct": total_contribution,
                 "valid_weight_sum": valid_weight_sum,
@@ -771,7 +772,7 @@ class HoldingService:
         start: str = "2026-07-01",
         min_coverage: float = None,
     ) -> Dict[str, Any]:
-        """持仓静态估值历史（季报持仓法 Model A，按币种 FX 折算口径）。
+        """持仓静态估值历史（季报持仓法 hsv，按币种 FX 折算口径）。
 
         与旧版（160723 硬编码 Q2 五只权重）的区别：
         1. 权重按期切换 —— 报告日 R 的持仓只用于 R 之后到下一份报告日之间，
@@ -1033,7 +1034,7 @@ class HoldingService:
                 # [AI-2026-10-05 东哥需求·导出核对 CSV] 复算所需的三个"原始输入"，
                 # 此前只存在于 periods[]（期级）与内部变量里，逐行导出后 CSV 才能自洽：
                 #   pos_pct        = 该行有效权重和(%)，即 est = prev_nav*(1 + pos_pct/100*r_basket) 的 pos。
-                #                    命名与 Model B（get_realtime_valuation）的 pos_pct 对齐 —— 两处
+                #                    命名与 hrv（get_realtime_valuation）的 pos_pct 对齐 —— 两处
                 #                    语义相同（r_basket 归一化的分母），不另立叫法。
                 #   weights        = 该行各腿**原始**权重(%)（未按 pos 归一，归一由公式里 /pos_pct 完成）
                 #   basket_change_pct = r_basket × 100，供与 Excel 公式列逐行比对
@@ -1308,10 +1309,10 @@ class HoldingService:
         return {"status": "ok", "written": written}
 
     # ------------------------------------------------------------------
-    # 持仓实时估值（Model B）：季报持仓法 + CL 期货实时价
+    # 持仓实时估值（hrv）：季报持仓法 + CL 期货实时价
     # ------------------------------------------------------------------
     def get_realtime_valuation(self, fund_code: str, cl_fetcher=None) -> Dict[str, Any]:
-        """持仓实时估值（Model B）—— 有效近月±1 三合约对比版。
+        """持仓实时估值（hrv）—— 有效近月±1 三合约对比版。
 
         cl_fetcher: 可选取价函数 (contract) -> (price, quote_time)。**仅 H5 只读看板
         `/api/oil_rt` 注入带 10s TTL 的共享取价器**，让三只原油基金复用同一次 CL 现价抓取。
@@ -1446,7 +1447,7 @@ class HoldingService:
         # 逐合约计算估值（分母/分子各自合约严格一致）
         # [AI-2026-09-17] 计算合约 = WTI active + Brent 书合约月（同月 CL 跨品种对冲反算）
         # [2026-11-12] 并入 WTI 书 in_book 月份；已摘牌合约剔除（新浪对摘牌合约返最后
-        # 成交价，会让该腿 ratio=1、Model B 恒等 hsv 的假数据）。
+        # 成交价，会让该腿 ratio=1、hrv 恒等 hsv 的假数据）。
         _today_d = _date.today()
 
         def _alive(m: str) -> bool:
@@ -1597,7 +1598,7 @@ class HoldingService:
                 pt: {"price": round(freeze[pt]["price"], 4), "trade_date": freeze[pt]["trade_date"]}
                 for pt in FREEZE_POINTS + EXTRA_POINTS if pt in freeze
             },
-            "realtime_nav": round(est, 6),
+            "hrv": round(est, 6),
             "lof_price": round(lof_price, 4) if lof_price is not None else None,
             "lof_price_source": lof_price_source,
             "realtime_premium": round(lof_price / est - 1, 6)
@@ -2583,7 +2584,7 @@ print(json.dumps({'updated': n}))
 
 
 def _rt_err(fund_code: str, code: str, **extra: Any) -> Dict[str, Any]:
-    """Model B 统一错误返回。"""
+    """hrv 统一错误返回。"""
     msg_map = {
         "no_report_holdings": "无季报持仓数据",
         "no_base_date": "无可用基准日期（今天之前无净值）",
