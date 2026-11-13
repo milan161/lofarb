@@ -366,7 +366,9 @@ POINT_BY_SYMBOL: Dict[str, str] = {
 #   产品定义就接近满仓。USCF 官网 9/4 持仓表：USO 名义敞口 18.10÷17.21≈105%，BNO 6.44÷6.04≈107%
 #   （SEC 10-Q 6/30 独立验证 BNO 108%）。详见已发表纠正文《3-纠正昨天原油基金的底层资产分析》。
 # 种子结构：(etf, weight_pct, futures_ratio, structure, contract_month, inner_ratio, variety, mcl_ok, in_book)
-#   in_book=1 → 计入表2 月份敞口聚合；in_book=0 → 结构特殊（动态单月/曲线分散），仅表1 标注「待核实」，不计入。
+#   in_book=1 → 计入表2 月份敞口聚合；in_book=0 → 不计入，分两类（2026-11-13 明确）：
+#     月份型（如 2611/2612）= 到期退役腿（roll 置 0 保留历史），表1 不展示、不算 pending；
+#     非月份型（待实测 / 曲线分散）= 结构不明，表1 展示并计入 pending_nav_pct。
 #   futures_ratio =「名义敞口倍数」= 合同金额(期货+互换名义价值) ÷ 净资产（非「期货市值占净值比」）。
 #   weight_pct 单位为「占基金净值%」（季报权重 ×100）。
 ETF_EXPOSURE_SEED = {
@@ -375,9 +377,11 @@ ETF_EXPOSURE_SEED = {
         ("CRUD", 18.87, 1.0, "TRS→彭博BCLMT4T（永久跳过近月，M2/M3/M4等权，每月重置）", "2612", 1.0 / 3, "WTI", 1, 1),
         ("CRUD", 18.87, 1.0, "TRS→彭博BCLMT4T（永久跳过近月，M2/M3/M4等权，每月重置）", "2701", 1.0 / 3, "WTI", 1, 1),
         ("USO", 18.78, 1.05, "直接持期货+互换（每月初滚仓；名义敞口≈105%=合同金额÷净资产，非44%）", "2611", 1.0, "WTI", 1, 1),
-        ("OILK", 18.54, 1.0, "直接持期货（官网披露三层梯式均布，全在远月；名义敞口≈满仓）", "2612", 1.0 / 3, "WTI", 0, 1),
-        ("OILK", 18.54, 1.0, "直接持期货（官网披露三层梯式均布，全在远月；名义敞口≈满仓）", "2706", 1.0 / 3, "WTI", 0, 1),
-        ("OILK", 18.54, 1.0, "直接持期货（官网披露三层梯式均布，全在远月；名义敞口≈满仓）", "2712", 1.0 / 3, "WTI", 0, 1),
+        # [2026-11-13] 官网 2026-11-11 Holdings 实测：CLG7(2702) 32.13% / CLM7(2706) 34.33% /
+        # CLZ7(2712) 33.53%，旧 2612 腿为 11-10 roll 误生成的近月假腿（OILK 全在远月），已退役。
+        ("OILK", 18.54, 1.0, "直接持期货（ProShares 官网 2026-11-11：CLG7/CLM7/CLZ7 三腿 32.13/34.33/33.53%，全在远月；名义敞口≈满仓）", "2702", 0.321332, "WTI", 0, 1),
+        ("OILK", 18.54, 1.0, "直接持期货（ProShares 官网 2026-11-11：CLG7/CLM7/CLZ7 三腿 32.13/34.33/33.53%，全在远月；名义敞口≈满仓）", "2706", 0.343334, "WTI", 0, 1),
+        ("OILK", 18.54, 1.0, "直接持期货（ProShares 官网 2026-11-11：CLG7/CLM7/CLZ7 三腿 32.13/34.33/33.53%，全在远月；名义敞口≈满仓）", "2712", 0.335334, "WTI", 0, 1),
         ("BNO", 18.37, 1.067, "直接持Brent近月（名义敞口≈107%=合同金额÷净资产，非52%；SEC 10-Q印证108%）", "2611", 1.0, "Brent", 0, 1),
         ("BRNT", 14.90, 1.0, "TRS→彭博BCOMCO4T（单合约，双月滚；2026-09-16 已滚至2701）", "2701", 1.0, "Brent", 0, 1),
         ("BRNG", 3.67, 1.0, "同BRNT（英镑份额）", "2701", 1.0, "Brent", 0, 1),
@@ -1712,10 +1716,20 @@ class HoldingService:
 
         as_of = max(r[9] for r in rows)
 
-        # 表1：按 ETF 分组（保持权重降序）；in_book=0 的 ETF 标 pending（待核实）
+        # 表1：按 ETF 分组（保持权重降序）
+        # [2026-11-13] in_book=0 有两类，必须分开（此前混为一谈 ⇒ 160723 pending 虚报 45.6%，
+        # 且 CRUD/USO/BNO 被误标「待核实」）：
+        #   ① 月份型（如 2611）= 到期退役腿 —— roll 工具置 0 保留历史，**已不实际持有**：
+        #      不展示、不计 pending；
+        #   ② 非月份型（待实测 / 曲线分散）= 结构确实不明 —— 展示并计入 pending。
+        def _is_month(m) -> bool:
+            return bool(m) and str(m).isdigit()
+
         etf_order: List[str] = []
         etf_map: Dict[str, Any] = {}
         for etf, w, fr, struct, month, ir, variety, mcl_ok, in_book, _as in rows:
+            if not in_book and _is_month(month):
+                continue  # 退役腿：不展示
             if etf not in etf_map:
                 etf_order.append(etf)
                 etf_map[etf] = {"etf": etf, "weight_pct": round(w, 2),
@@ -1727,13 +1741,15 @@ class HoldingService:
                 {"month": month, "pct": round(ir * 100, 1), "mcl_ok": bool(mcl_ok), "in_book": bool(in_book)})
         etfs = [etf_map[e] for e in etf_order]
 
-        # 表2：按合约月聚合（仅 in_book=1 的已知单月 ETF；待核实 ETF 不计入，避免兜底假数据）
+        # 表2：按合约月聚合（仅 in_book=1；退役腿与待核实均不计入，避免兜底假数据）
+        # [2026-11-13] pending 只统计「结构不明」（非月份型），退役腿不进 pending。
         wti_agg: Dict[str, Dict[str, Any]] = {}
         brent_agg: Dict[str, Dict[str, Any]] = {}
         wti_total = brent_total = pending_total = 0.0
         for etf, w, fr, _struct, month, ir, variety, mcl_ok, in_book, _as in rows:
             if not in_book:
-                pending_total += w * fr * ir
+                if not _is_month(month):
+                    pending_total += w * fr * ir
                 continue
             exp = w * fr * ir  # % of NAV
             if variety == "WTI":

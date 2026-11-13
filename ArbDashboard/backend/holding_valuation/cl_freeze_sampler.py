@@ -126,6 +126,42 @@ def get_brent_hedge_months(db_path: str) -> list[str]:
         return []
 
 
+def _yymm_add(yymm: str, n: int) -> str:
+    """'2611' + 2 -> '2701'。"""
+    yy, mm = int(yymm[:2]), int(yymm[2:])
+    total = (2000 + yy) * 12 + (mm - 1) + n
+    return f"{total // 12 % 100:02d}{total % 12 + 1:02d}"
+
+
+def get_wti_exposure_months(db_path: str, span: int = 5) -> list[str]:
+    """从 etf_contract_exposure 取 WTI 书、in_book=1 的合约月，只保留近端窗口
+    「当月+1 ~ 当月+span」（默认 5 ⇒ 11 月覆盖 2612~2704）。
+
+    [2026-11-13] 起因：采样器原先只采「未到期最早 3 个」（旧规则当月+2 起），
+    CRUD/1699/03175 的远月腿（2703/2704）**永远采不到价** ⇒ `hedge_plan` 这两条腿
+    报 `no_price`、也无法用日收益拟合校验 ETF 到底持哪个月。
+    只采近端窗口，不采 OILK 的 2706/2712（非连续远月、`manual` 结构，无对冲用途）。
+    表不存在 / 查询失败返回 []（不影响 WTI 主采样）。
+    """
+    try:
+        conn = sqlite3.connect(db_path)
+        try:
+            rows = conn.execute(
+                "SELECT DISTINCT contract_month FROM etf_contract_exposure "
+                "WHERE variety='WTI' AND in_book=1 "
+                "AND contract_month IS NOT NULL AND contract_month != ''"
+            ).fetchall()
+        finally:
+            conn.close()
+    except Exception:
+        return []
+    base = ny_now().strftime("%y%m")
+    lo, hi = _yymm_add(base, 1), _yymm_add(base, span)
+    out = [r[0] for r in rows if isinstance(r[0], str) and r[0].isdigit()
+           and len(r[0]) == 4 and lo <= r[0] <= hi]
+    return sorted(set(out))
+
+
 # 运行时合约列表（main() 启动时算一次，当天不变）
 CONTRACTS: list[str] = []
 SRC = "sina"
@@ -382,6 +418,12 @@ def main() -> int:
     global CONTRACTS
     CONTRACTS = get_active_cl_contracts(now.date())
     for m in get_brent_hedge_months(args.db):
+        if m not in CONTRACTS:
+            CONTRACTS.append(m)
+    # [2026-11-13] WTI 书里 in_book=1 的近端月份（当月+1 ~ 当月+5）：
+    # CRUD/1699/03175 的 2703/2704 腿此前永远无价（旧采样只覆盖「当月+2 起 2 个」），
+    # 导致 hedge_plan 报 no_price、且无法用日收益拟合校验 ETF 真实持仓月份。
+    for m in get_wti_exposure_months(args.db):
         if m not in CONTRACTS:
             CONTRACTS.append(m)
     # [2026-11-10] 近月链起点（当月+1）：016 观察表与 USO/1671/03175 近月腿需要

@@ -7,7 +7,7 @@ ArbIntradaySamplerDaemon —— ARM 原生分时采集守护进程（独立 syst
 - 2026-10-09 重构把 main.py 里的本地分时采样实例化删了（注释"分时由 ARM 采集"），
   但 ARM 侧那个采集器从没立起来 → fund_intraday_quotes 自 2026-10-10 起冻结。
 - 现成 IntradaySamplerService 本身完全可用：它调 get_realtime_quote → 腾讯 gtimg
-  （ARM 实测可达，price 正常返回），写入目标基金 162411/164701/161116。
+  （ARM 实测可达，price 正常返回），写入目标基金 162411/164701/161116/513350/159518。
 - 本守护进程 = 把现成 IntradaySamplerService 作为**独立进程**常驻运行，
   物理上仍在 ARM（arb-dashboard 同一台机器），符合"分时归 ARM 采集"的意图，
   且与 arb-dashboard 解耦：重启后端不影响采集，亦能被健康巡检独立监控。
@@ -30,7 +30,10 @@ os.environ.setdefault("FUTU_HOST", "10.0.0.83")
 
 # 路径：保证能 import arbcore / services
 BACKEND = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-SRC = os.path.dirname(BACKEND)
+# [2026-11-13 修] 原为 dirname(BACKEND) = .../ArbDashboard，**少推一层** ⇒ 找不到 src/arbcore，
+# ARM 上一重启就 ModuleNotFoundError: No module named 'arbcore'（11-08 起运行的是旧内存副本，掩盖至今）。
+# 与 main.py 同规则：backend/../.. = .../src（arbcore 真实位置）。
+SRC = os.path.normpath(os.path.join(BACKEND, "..", ".."))
 for p in (BACKEND, SRC):
     if p not in sys.path:
         sys.path.insert(0, p)

@@ -1557,12 +1557,14 @@ def get_fund_intraday(code: str, date: str = None, days: int = 1):
     """获取基金的分时数据（曲线图用，支持多日）
     - days: 向前回溯天数（1/3/5），默认1天
     """
-    # [2026-08-27] 当日首次请求时后台触发从 ARM 同步当日分时（本地不采，ARM/AMD 采后回传）
+    # [2026-11-13] 改为**同步等待**同步：原 fire-and-forget 会先返回旧数据，用户点开看不到最新分钟。
+    # 本端点是同步 def（FastAPI 放线程池执行），不阻塞事件循环（符合"async 端点禁同步阻塞"铁律）。
+    # TTL 60s 内秒回；超出才真跑一次 ssh（≈1s）；失败退避 5 分钟，避免反复卡超时。
     try:
         from services.intraday.arm_sync_service import ensure_synced_today
-        threading.Thread(target=ensure_synced_today, daemon=True).start()
+        ensure_synced_today()
     except Exception as e:
-        logger.warning(f"触发 ARM 分时同步失败(忽略): {e}")
+        logger.warning(f"同步 ARM 分时失败(忽略): {e}")
     data = fund_service.get_fund_intraday(code, date, days)
     return {"status": "ok", "data": data}
 
