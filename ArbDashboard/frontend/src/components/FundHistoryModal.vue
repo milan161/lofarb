@@ -237,13 +237,24 @@ const errorPage = ref(1)
 const errorPageSize = 15
 // [AI-2026-10-07 修复] 必须 ...r 展开整行：点行弹窗（dayHoldRows）要从同一对象读 {sym}_price/_price_chg/_weight，
 // 只留四列会导致弹窗全"-"（估值标的现由 valuation_portfolio/related_index 派生，故行对象须展开整行）
-const errorRows = computed<any[]>(() => (fundHistory.value || []).map((r: any) => ({
-  ...r,
-  date: r.date,
-  nav: r.nav,
-  val: r.static_val,
-  err: (r.static_val != null && r.nav != null) ? r.static_val - r.nav : null
-})))
+const errorRows = computed<any[]>(() => {
+  const rows = (fundHistory.value || []).map((r: any) => ({
+    ...r,
+    date: r.date,
+    nav: r.nav,
+    val: r.static_val,
+    err: (r.static_val != null && r.nav != null) ? r.static_val - r.nav : null
+  }))
+  // [AI-2026-11-14 东哥需求] 溢价 = 本行「价格」÷ 上一交易日「净值」− 1。
+  //   后端 SQL 是 ORDER BY date DESC（最新在前）⇒ rows[i+1] 就是更早的那个交易日，
+  //   正好对应东哥说的"下面一行的净值"。
+  //   必须在这里基于整表算：表格分页每页 15 天，render 里看不到下一行。
+  rows.forEach((r: any, i: number) => {
+    const prevNav = rows[i + 1]?.nav
+    r.premium = (r.price != null && prevNav) ? (r.price / prevNav - 1) * 100 : null
+  })
+  return rows
+})
 const pagedErrorRows = computed(() => {
   const start = (errorPage.value - 1) * errorPageSize
   return errorRows.value.slice(start, start + errorPageSize)
@@ -251,8 +262,16 @@ const pagedErrorRows = computed(() => {
 watch(fundHistory, () => { errorPage.value = 1 })
 const errorColumns = computed<DataTableColumns<any>>(() => [
   { title: '日期', key: 'date', width: 100, align: 'center', render: (r: any) => h('span', { class: 'num-cell' }, shortDate(r.date)) },
+  // [AI-2026-11-14 东哥需求] 价格列：LOF 历史收盘价（后端 SQL 一直有查 h.price，此前未展示）
+  { title: '价格', key: 'price', width: 110, align: 'center', render: (r: any) => h('span', { class: 'num-cell' }, formatValuation(r.price)) },
   // [AI-2026-10-07 东哥要求] 净值列保留 4 位小数（与估值列同精度）
   { title: '净值', key: 'nav', width: 120, align: 'center', render: (r: any) => h('span', { class: 'num-cell' }, formatValuation(r.nav)) },
+  // [AI-2026-11-14 东哥需求] 溢价 = 本行价格 ÷ 上一交易日净值 − 1（在 errorRows 里基于整表算好）
+  { title: '溢价', key: 'premium', width: 110, align: 'center', render: (r: any) => {
+    if (r.premium == null) return h('span', { style: 'color: var(--co-neutral)' }, '-')
+    const color = r.premium > 0 ? 'var(--co-up)' : (r.premium < 0 ? 'var(--co-down)' : 'var(--co-text)')
+    return h('span', { style: `color:${color};font-weight:600;` }, (r.premium >= 0 ? '+' : '') + Number(r.premium).toFixed(2) + '%')
+  } },
   { title: '估值', key: 'val', width: 120, align: 'center', render: (r: any) => h('span', { class: 'num-cell' }, formatValuation(r.val)) },
   { title: '误差', key: 'err', width: 110, align: 'center', render: (r: any) => {
     if (r.err == null) return h('span', { style: 'color: var(--co-neutral)' }, '-')

@@ -83,7 +83,11 @@
     <FundHistoryModal v-model:show="showHistoryModal" :fund-code="selectedFund?.fund_code || ''" :fund="selectedFund" />
 
     <!-- 白银比价弹窗 -->
-    <n-modal v-model:show="showSilverRatioModal" preset="card" title="白银比价监控 (161226)" style="width: 90%; max-width: 1200px;">
+    <!-- [AI-2026-11-14 修 BUG] 真正原因不是高度/定位，而是 NModal 没 import（已补）。
+         之前误判为"弹窗太高撑破视口"，加的 v-if 只是把它从"一进页面就有"
+         变成"点击后才出现"，症状反而更明显 ⇒ 现已撤掉 v-if，恢复标准写法。
+         height:85vh 保留：内容确实多（180+ 行 + 图表），限高后内部滚动更合用。 -->
+    <n-modal v-model:show="showSilverRatioModal" preset="card" title="白银比价监控 (161226)" style="width: 90%; max-width: 1200px; height: 85vh;">
       <SilverRatio />
     </n-modal>
   </div>
@@ -95,6 +99,11 @@ import { ref, onMounted, h, computed, watch, onUnmounted } from 'vue'
 import { storeToRefs } from 'pinia'
 import {
   NGrid, NGi, NCard, NIcon, NText, NInput,
+  // [AI-2026-11-14 修 BUG] 补 NModal：本文件第 89 行用了 <n-modal> 但从未 import，
+  //   Vue 解析不到该组件 ⇒ 退化成未知 HTML 标签，slot 内容按普通文档流渲染，
+  //   表现为「白银比价」直接显示在主看板下方、无遮罩、无关闭按钮，切 Tab 也一直挂着。
+  //   （FundHistoryModal.vue 里一直正常，就是因为它自己 import 了 NModal。）
+  NModal,
   NButton, NDataTable, NTag, NTabs, NTabPane, useMessage
 } from 'naive-ui'
 import type { DataTableColumns } from 'naive-ui'
@@ -169,7 +178,7 @@ const isCashManagementFund = computed(() => {
 
 let refreshTimer: any = null
 
-// [2026-11-14] 自选已 DB 化（见 ARM_LOCAL_FAILOVER.md §1.1），唯一真源 = fund_watchlist 表；
+// [2026-11-14] 自选已 DB 化（见 全站主备说明.md §1.1），唯一真源 = fund_watchlist 表；
 // 前端不再写 localStorage，原「Watch 自选持久化」监听器删除。
 
 // ===== 方法 =====

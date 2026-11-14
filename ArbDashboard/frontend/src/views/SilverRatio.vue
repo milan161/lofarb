@@ -209,6 +209,8 @@ onMounted(() => {
 </script>
 
 <style scoped>
-.silver-ratio-page { padding: 12px; }
+/* [AI-2026-11-14] 加 height/overflow：本组件既可能独立成页，也被塞进 n-modal（高 85vh）。
+   固定高度 + 内部滚动，弹窗才不会撑出视口、看起来像常驻卡片。 */
+.silver-ratio-page { padding: 12px; height: 100%; overflow-y: auto; box-sizing: border-box; }
 .shadow-soft { box-shadow: 0 4px 20px rgba(0, 0, 0, 0.04); border-radius: 12px; }
 </style>

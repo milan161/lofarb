@@ -876,4 +876,11 @@ defineExpose({
 <style scoped>
 /* [AI-2026-10-08] .rt-hold-table 全套样式已迁入共享组件 shared/RtHoldingTable.vue
                   （scoped 样式不跨组件，故必须随表格一起搬，不能只留标签） */
+
+/* [AI-2026-11-14 东哥需求] 参数行（T-2基准日 / T-1估值日 / 实时数据）里
+   「净值」「汇率」「校准因子」等中文标签与后面的数字贴在一起（"净值1.2878"），
+   给标签加右间距留白。三行共用 base-info-row 一个 class。 */
+.base-info-row strong {
+  margin-right: 5px;
+}
 </style>
