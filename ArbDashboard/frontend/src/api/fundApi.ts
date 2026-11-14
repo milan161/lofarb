@@ -121,26 +121,6 @@ export function getHistoricalPrice(code: string, startDate?: string) {
   return client.get(`/api/market/historical/price/${code}`, { params: { start_date: startDate } })
 }
 
-/** 幽灵做市商实时计算 */
-export function getLazyCalc(fundCode: string) {
-  return client.get('/api/private/lazy_calc', { params: { fund_code: fundCode } })
-}
-
-/** 幽灵做市商 - 诊断状态 */
-export function getLazyStatus() {
-  return client.get('/api/private/lazy_status')
-}
-
-/** 幽灵模拟器 - 获取状态 */
-export function getLazySimStatus() {
-  return client.get('/api/private/lazy_simulate/status')
-}
-
-/** 幽灵模拟器 - 控制(start/stop/reset/force_signal) */
-export function postLazySimControl(action: string, extras?: Record<string, any>) {
-  return client.post('/api/private/lazy_simulate/control', { action, ...extras })
-}
-
 /** 债券ETF - 设置手动BP覆盖 */
 export function postBpOverride(code: string, bp7y: number, bp10y: number) {
   return client.post('/api/bond/bp-override', { code, bp_7y: bp7y, bp_10y: bp10y })

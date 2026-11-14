@@ -398,8 +398,6 @@ def _popen_script_once(cmd, cwd, script_name: str) -> bool:
     return True
 
 # [AI-2026-10-10] Private export 插件已剥离至 LOFTrader，移除挂载逻辑（.gitignore 已屏蔽 **/private/，不入库）
-# [AI-2026-10-08] LazyTrader 随交易内核剥离至 LOFTrader（交易见 :8001）。
-lazy_trader_instance = None
 
 # [AI-2026-10-09 东哥拍板] Lazy Simulator（周末 mock 数据）随交易域剥离至 LOFTrader。
 #   该能力本质是「造信号驱动下单演练」，属交易侧；LOFTrader :8001 已实现并被前端调用。
@@ -2148,7 +2146,7 @@ async def import_fund_config(file: UploadFile = File(...)):
         return {"status": "error", "message": str(e)}
 
 # [2026-11-14] 自选（fund_watchlist）DB 化 CRUD（B 类用户选择，本地权威，经 sync_to_arm.py 上推 ARM）
-# 前端已彻底去 localStorage，自选唯一真源 = fund_watchlist 表（见 ARM_LOCAL_FAILOVER.md §1.1）
+# 前端已彻底去 localStorage，自选唯一真源 = fund_watchlist 表（见 全站主备说明.md §1.1）
 @app.get("/api/watchlist")
 def get_watchlist():
     import sqlite3
@@ -2306,195 +2304,6 @@ ALL_CATEGORIES = ["黄金原油", "QDII欧美", "QDII日本", "商品"]
 
 # [AI-2026-07-07] 回补缺失指数历史
 # [AI-2026-10-10] Private export 端点已剥离至 LOFTrader（/api/private/status + /api/private/export/{code} 移除）
-@app.get("/api/private/lazy_calc")
-async def lazy_calc(fund_code: str = "162411"):
-    """
-    幽灵做市商实时计算 — 复用 fund_service.get_valuation_meta() 获取完整估值数据。
-    额外计算 Lazy 特有模式（safe/peg）的折溢价。
-    """
-    if not lazy_trader_instance:
-        return JSONResponse(status_code=403, content={"status": "error", "message": "Lazy Trader not loaded"})
-
-    try:
-        # 1. 复用现有估值元数据（含 hedge、汇率、实时报价、T-1 基准等）
-        meta = fund_service.get_valuation_meta(fund_code)
-        if meta.get("status") == "error":
-            return JSONResponse(status_code=404, content=meta)
-
-        base_data = meta.get("base_data", {})
-        fund_cfg = meta.get("fund_config", {})
-        rt_quotes = meta.get("realtime_quotes", {})
-        t1_data = meta.get("t1_data", {})
-        latest_fx = meta.get("latest_exchange_rate", 7.25)
-
-        # 2. 获取 LOF 实时行情
-        lof_price = 0.0
-        lof_bid = 0.0
-        lof_ask = 0.0
-        if market_data_service:
-            try:
-                rt = market_data_service.get_realtime_quote(fund_code)
-                if rt:
-                    lof_price = rt.get("price", 0) or 0
-                    lof_bid = rt.get("bid") or lof_price
-                    lof_ask = rt.get("ask") or lof_price
-            except Exception:
-                pass
-        if lof_price <= 0:
-            lof_price = float(t1_data.get("price", 0) or 0)
-            lof_bid = lof_price
-            lof_ask = lof_price
-
-        # 3. 确定 underlying_symbol 和最相关的 ETF 实时价格
-        portfolio = fund_cfg.get("valuation_portfolio", [])
-        underlying_symbol = portfolio[0].get("symbol", "") if portfolio else ""
-        # [V10.8] basket为空时用 trade_etf（related_index）备用源（如162411→XOP）
-        if not underlying_symbol:
-            underlying_symbol = fund_cfg.get("trade_etf", "")
-        underlying_clean = ""
-        if underlying_symbol:
-            s = underlying_symbol.replace("^", "")
-            for suffix in ["-EU", "-JP", "-HK"]:
-                if s.endswith(suffix):
-                    s = s[: -len(suffix)]
-                    break
-            underlying_clean = s
-
-        us_bid = 0.0
-        us_ask = 0.0
-        us_bid_size = 0
-        us_ask_size = 0
-        # [V10.8] 优先从 rt_quotes 取；basket为空时 rt_quotes 为空，直接行情驱动备用源
-        if underlying_clean and underlying_clean in rt_quotes and rt_quotes[underlying_clean]:
-            q = rt_quotes[underlying_clean]
-            us_bid = float(q.get("bid", 0) or 0)
-            us_ask = float(q.get("ask", 0) or 0)
-            us_bid_size = int(q.get("bid_size", 0) or 0)
-            us_ask_size = int(q.get("ask_size", 0) or 0)
-            if us_bid <= 0:
-                us_bid = float(q.get("price", 0) or 0)
-            if us_ask <= 0:
-                us_ask = float(q.get("price", 0) or 0)
-        elif underlying_clean and market_data_service:
-            try:
-                q = market_data_service.get_realtime_quote(underlying_clean)
-                if q:
-                    us_bid = float(q.get("bid", 0) or 0)
-                    us_ask = float(q.get("ask", 0) or 0)
-                    us_bid_size = int(q.get("bid_size", 0) or 0)
-                    us_ask_size = int(q.get("ask_size", 0) or 0)
-                    if us_bid <= 0:
-                        us_bid = float(q.get("price", 0) or 0)
-                    if us_ask <= 0:
-                        us_ask = float(q.get("price", 0) or 0)
-            except Exception as e:
-                logger.error(f"[LazyCalc] failed to get quote for {underlying_clean}: {e}")
-
-        # 4. hedge 值（复用 get_valuation_meta 返回的）
-        hedge = float(base_data.get("hedge", 0)) if base_data else 0
-        position = float(fund_cfg.get("position")) / 100.0 if fund_cfg and fund_cfg.get("position") is not None else None  # [AI-2026-08-07] 缺失即 None，禁止 0.95 默认
-
-        # 5. Lazy 特有溢价计算（safe 砸单 / peg 内卷）
-        # 正确公式: val = base_nav * (1 - pos) + (us_price * fx) / hedge  (注意: 第二项不乘pos)
-        base_nav = float(base_data.get("nav", 0)) if base_data else 0
-        if base_nav > 0 and hedge > 0 and position is not None:  # [AI-2026-08-07] position 可能 None
-            val_safe = base_nav * (1 - position) + (us_bid * latest_fx) / hedge
-        else:
-            val_safe = 0
-        premium_safe = (lof_bid / val_safe - 1) * 100 if val_safe > 0 else 0
-
-        if base_nav > 0 and hedge > 0 and position is not None:  # [AI-2026-08-07] position 可能 None
-            peg_price = (us_ask - 0.01) if us_ask > 0.01 else us_ask
-            val_peg = base_nav * (1 - position) + (peg_price * latest_fx) / hedge
-        else:
-            val_peg = 0
-        premium_peg = (lof_bid / val_peg - 1) * 100 if val_peg > 0 else 0
-
-        # [AI-2026-07-07] 赎回费率优先从 broker_redemption_fees 表读取
-        redemption_fee = ledger_service.get_fee_rate(fund_code)
-        if redemption_fee <= 0:
-            redemption_fee = 0.50
-
-        result = {
-            "fund_code": fund_code,
-            "fund_name": fund_cfg.get("trade_etf", ""),
-            "underlying_symbol": underlying_symbol,
-            "hedge": hedge,
-            "position": position,
-            "fx_rate": latest_fx,
-            "lof_price": lof_price,
-            "lof_bid": lof_bid,
-            "lof_ask": lof_ask,
-            "us_bid": us_bid,
-            "us_ask": us_ask,
-            "us_bid_size": us_bid_size,
-            "us_ask_size": us_ask_size,
-            "premium_safe": round(premium_safe, 3),
-            "premium_peg": round(premium_peg, 3),
-            "redemption_fee": redemption_fee,
-        }
-        return {"status": "ok", "data": result}
-
-    except Exception as e:
-        logger.error(f"[LazyCalc] Error: {e}", exc_info=True)
-        return JSONResponse(status_code=500, content={"status": "error", "message": str(e)})
-
-def _resolve_hedge_for_order(fund_code, underlying_symbol):
-    """[AI-2026-09-02] 同步 DB 查询：从 fund_daily_factors 取 hedge，取不到则动态推算。
-    只供 asyncio.to_thread 调用 —— 同步 SQLite 调用不得留在事件循环里。
-    返回 float 或 None（缺失即 None，禁止 1.0 假常量）。"""
-    import pandas as pd
-    conn2 = db._get_conn()
-    try:
-        h_df = pd.read_sql(
-            "SELECT hedge FROM fund_daily_factors "
-            "WHERE fund_code=? AND hedge IS NOT NULL AND hedge > 0 "
-            "ORDER BY date DESC LIMIT 1",
-            conn2, params=[fund_code]
-        )
-        if not h_df.empty:
-            return float(h_df.iloc[0]['hedge'])
-        # 备用源：动态推算
-        pos_df = pd.read_sql(
-            "SELECT position FROM fund_daily_factors "
-            "WHERE fund_code=? AND position IS NOT NULL ORDER BY date DESC LIMIT 1",
-            conn2, params=[fund_code]
-        )
-        position = float(pos_df.iloc[0]['position']) if not pos_df.empty else None  # [AI-2026-08-07] 缺失即 None
-        nav_df = pd.read_sql(
-            "SELECT nav, price FROM unified_fund_history "
-            "WHERE fund_code=? AND nav>0 ORDER BY date DESC LIMIT 1",
-            conn2, params=[fund_code]
-        )
-        nav = float(nav_df.iloc[0]['nav']) if not nav_df.empty else None  # [AI-2026-08-07] 缺失即 None
-        fx_df = pd.read_sql(
-            # [AI-2026-10-07] 加 IS NOT NULL：节假日最新一行 mid 为 NULL，
-            #   原写法 float(None) 抛 TypeError → 整函数失败 → 下单被误判为"hedge 不足"拒绝。
-            #   与 fund_service.get_valuation_meta 同口径：取最近一次已公布中间价。
-            #   [AI-2026-10-09] 原参照 sampler_service 已随本地采样移除（分时归 ARM）。
-            "SELECT usd_cny_mid FROM exchange_rate "
-            "WHERE usd_cny_mid IS NOT NULL ORDER BY date DESC LIMIT 1", conn2
-        )
-        fx = float(fx_df.iloc[0]['usd_cny_mid']) if not fx_df.empty else None  # [AI-2026-08-07] 缺失即 None，禁止 7.25 假常量
-        # hedge = (ETF基价 * 汇率) / (净值 * 仓位)
-        # 用 t1 的 etf 收盘价作为基价近似
-        etf_base = 0.0
-        if underlying_symbol:
-            etf_df = pd.read_sql(
-                "SELECT COALESCE(NULLIF(netvalue, 0), price) as price "
-                "FROM usa_etf_daily_prices WHERE symbol LIKE ? "
-                "ORDER BY date DESC LIMIT 1",
-                conn2, params=[f"%{underlying_symbol}%"]
-            )
-            if not etf_df.empty:
-                etf_base = float(etf_df.iloc[0]['price'])
-        if etf_base > 0 and nav is not None and nav > 0 and position is not None and position > 0 and fx is not None:  # [AI-2026-08-07] guard None
-            return (etf_base * fx) / (nav * position)
-        return None  # [AI-2026-08-07] SUPREME：推算所需数据不全，禁止 1.0 假常量，缺失即 None 显 --
-    finally:
-        conn2.close()
-
-
 @app.post("/api/bond/bp-override")
 async def set_bp_override(request: Request):
     """[已停用] 511520 手动 BP 覆盖 → 见 ETFarb"""
@@ -2787,7 +2596,7 @@ def _reconnect_galaxy_local():
             rm.active_fetchers['galaxy'] = galaxy
             success, msg = galaxy.reconnect()
         if success:
-            # [AI-2026-11-14] 剥离后 8000 侧 lazy_trader_instance 恒 None，
+            # [AI-2026-11-14] 剥离后 8000 侧已无交易内核（lazy_trader_instance 占位变量已删），
             # 原来的 inject_drivers(...) 是死代码 —— 点了只把标签点亮，实际下不了单。
             # 已移除；下单侧由 8001 的 /api/system/channel_connect 接管。
             logger.info("[银河QMT] 8000 行情侧注册完成；下单侧结果见 trade_side")
