@@ -169,10 +169,8 @@ const isCashManagementFund = computed(() => {
 
 let refreshTimer: any = null
 
-// ===== Watch 自选持久化 =====
-watch(watchlist, (newVal) => {
-  localStorage.setItem('watchlist', JSON.stringify(newVal))
-}, { deep: true })
+// [2026-11-14] 自选已 DB 化（见 ARM_LOCAL_FAILOVER.md §1.1），唯一真源 = fund_watchlist 表；
+// 前端不再写 localStorage，原「Watch 自选持久化」监听器删除。
 
 // ===== 方法 =====
 // [AI-2026-10-07] 拉取 fundHistory 移入 FundHistoryModal（watch show 触发），此处只选中行并开弹窗

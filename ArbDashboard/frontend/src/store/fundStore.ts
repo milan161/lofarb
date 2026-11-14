@@ -89,17 +89,40 @@ export const useFundStore = defineStore('fund', () => {
   const intradayData = ref<any[]>([])
   const basketData = ref<any[]>([])
 
-  // ---- watchlist（持久化到 localStorage） ----
-  const DEFAULT_WATCHLIST = ['162411']
-  const savedWatchlist = (() => {
+  // ---- watchlist（DB 化为唯一真源；见 ARM_LOCAL_FAILOVER.md §1.1：B 类用户选择，本地权威上推 ARM）----
+  const watchlist = ref<string[]>([])
+  let watchlistInitialized = false
+  async function loadWatchlist() {
+    if (watchlistInitialized) return
+    watchlistInitialized = true
     try {
-      const w = JSON.parse(localStorage.getItem('watchlist') || 'null')
-      return Array.isArray(w) && w.length > 0 ? w : DEFAULT_WATCHLIST
-    } catch {
-      return DEFAULT_WATCHLIST
+      const res = await fetch('/api/watchlist')
+      const data = await res.json()
+      if (data?.status === 'ok' && Array.isArray(data.data)) {
+        watchlist.value = data.data.map((r: any) => r.fund_code)
+      }
+    } catch (e) {
+      console.error('加载自选失败', e)
     }
-  })()
-  const watchlist = ref<string[]>(savedWatchlist)
+    // 一次性迁移：DB 空且 localStorage 仍有旧自选 → 推上 DB 后清 localStorage（避免丢历史自选）
+    if (watchlist.value.length === 0) {
+      try {
+        const legacy = JSON.parse(localStorage.getItem('watchlist') || 'null')
+        if (Array.isArray(legacy) && legacy.length > 0) {
+          await Promise.all(legacy.map((code: string) =>
+            fetch('/api/watchlist', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ fund_code: code })
+            })))
+          watchlist.value = legacy
+        }
+      } catch (e) { /* 迁移失败不影响后续 */ }
+      localStorage.removeItem('watchlist')
+    }
+    // 若当前在「自选」TAB，加载完成后静默重拉一次（首屏时序保证有数据）
+    if (currentTab.value === '自选') fetchDashboard(true)
+  }
 
   // ---- getters ----
   /** [AI-2026-10-07] QDII欧美固定排序（东哥指定分组顺序，便于同组比较）。
@@ -165,11 +188,29 @@ export const useFundStore = defineStore('fund', () => {
   )
 
   // ---- actions ----
-  function toggleWatchlist(code: string) {
+  // [2026-11-14] 写 DB（乐观更新 + 失败回滚），不再落 localStorage
+  async function toggleWatchlist(code: string) {
     const idx = watchlist.value.indexOf(code)
-    if (idx > -1) watchlist.value.splice(idx, 1)
-    else watchlist.value.push(code)
-    localStorage.setItem('watchlist', JSON.stringify(watchlist.value))
+    const adding = idx === -1
+    if (adding) watchlist.value.push(code)
+    else watchlist.value.splice(idx, 1)
+    try {
+      if (adding) {
+        await fetch('/api/watchlist', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ fund_code: code })
+        })
+      } else {
+        await fetch(`/api/watchlist/${code}`, { method: 'DELETE' })
+      }
+    } catch (e) {
+      // 回滚
+      const i = watchlist.value.indexOf(code)
+      if (adding && i > -1) watchlist.value.splice(i, 1)
+      else if (!adding && i === -1) watchlist.value.push(code)
+      console.error('更新自选失败', e)
+    }
   }
 
   function isInWatchlist(code: string) {
@@ -273,6 +314,9 @@ export const useFundStore = defineStore('fund', () => {
     // 用户看到的是已缓存的分类数据而非空白转圈。
     // 后台静默刷新会在 watch(currentTab) 中触发 fetchData(true)
   }
+
+  // 初始化：从 DB 加载自选（含一次性迁移旧 localStorage）
+  loadWatchlist()
 
   return {
     tableData, loading, currentTab, searchKeyword,

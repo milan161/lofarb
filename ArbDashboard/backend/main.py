@@ -2147,6 +2147,60 @@ async def import_fund_config(file: UploadFile = File(...)):
         logger.error(f"导入 YAML 失败: {e}")
         return {"status": "error", "message": str(e)}
 
+# [2026-11-14] 自选（fund_watchlist）DB 化 CRUD（B 类用户选择，本地权威，经 sync_to_arm.py 上推 ARM）
+# 前端已彻底去 localStorage，自选唯一真源 = fund_watchlist 表（见 ARM_LOCAL_FAILOVER.md §1.1）
+@app.get("/api/watchlist")
+def get_watchlist():
+    import sqlite3
+    try:
+        conn = sqlite3.connect(root_db_path, timeout=30)
+        rows = conn.execute(
+            "SELECT fund_code, fund_name, category, added_date, notes FROM fund_watchlist ORDER BY added_date, fund_code"
+        ).fetchall()
+        conn.close()
+        return {"status": "ok", "data": [
+            {"fund_code": r[0], "fund_name": r[1], "category": r[2], "added_date": r[3], "notes": r[4]}
+            for r in rows
+        ]}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+
+@app.post("/api/watchlist")
+async def add_watchlist(request: Request):
+    import sqlite3
+    try:
+        data = await request.json()
+        code = (data.get("fund_code") or "").strip()
+        if not (code and code.isdigit() and len(code) == 6):
+            return {"status": "error", "message": "fund_code 非法（需 6 位数字）"}
+        conn = sqlite3.connect(root_db_path, timeout=30)
+        conn.execute(
+            "INSERT OR REPLACE INTO fund_watchlist (fund_code, fund_name, category, added_date, notes) VALUES (?,?,?,?,?)",
+            (code, data.get("fund_name") or "", data.get("category") or "",
+             data.get("added_date") or datetime.now().strftime("%Y-%m-%d"), data.get("notes") or ""))
+        conn.commit()
+        conn.close()
+        return {"status": "ok", "fund_code": code}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+
+@app.delete("/api/watchlist/{code}")
+def delete_watchlist(code: str):
+    import sqlite3
+    if not (code and code.isdigit() and len(code) == 6):
+        return {"status": "error", "message": "code 非法（需 6 位数字）"}
+    try:
+        conn = sqlite3.connect(root_db_path, timeout=30)
+        conn.execute("DELETE FROM fund_watchlist WHERE fund_code=?", (code,))
+        conn.commit()
+        conn.close()
+        return {"status": "ok", "fund_code": code}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+
 # [AI-2026-07-09] 动态 TAB：返回 unified_fund_list 中所有去重的基金分类，供主看板动态生成 TAB
 @app.get("/api/config/categories")
 # [AI-2026-09-02] 改为同步 def：FastAPI 会自动把它丢进线程池执行，
@@ -2441,660 +2495,6 @@ def _resolve_hedge_for_order(fund_code, underlying_symbol):
         conn2.close()
 
 
-@app.post("/api/private/lazy_place_order")
-async def lazy_place_order(request: Request):
-    """
-    幽灵做市商下单接口
-    - quantity: LOF 份额数（如 59500），系统自动用 hedge 系数换算出 ETF 对冲股数
-    - etf_quantity: 可选，如果前端已算好 ETF 股数，直接使用（绕开换算）
-    """
-    if not lazy_trader_instance:
-        logger.warning("[LazyOrder] lazy_trader_instance is None - orders will be rejected")
-        return JSONResponse(status_code=403, content={"status": "error", "message": "Lazy Trader not loaded"})
-    try:
-        body = await request.json()
-        mode = body.get("mode", "safe")          # "safe"/"peg" 向后兼容
-        direction = body.get("direction", "open") # "open" 开仓 / "close" 平仓
-        fund_code = body.get("fund_code", "162411")
-        underlying_symbol = body.get("underlying_symbol", "XOP")
-        price = float(body.get("price", 0))        # open→us_bid1, close→us_ask1
-        lof_price = float(body.get("lof_price", 0))  # LOF 限价
-        lof_quantity = int(body.get("quantity", 0))
-        etf_quantity = int(body.get("etf_quantity", 0))
-        logger.info(f"[LazyOrder] mode={mode} dir={direction} fund={fund_code} etf={underlying_symbol} etf_qty={etf_quantity} price={price}")
-
-        # 从 fund_daily_factors 获取 hedge 值（与 Analysis.vue 实时沙盘一致）
-        if etf_quantity <= 0 and lof_quantity > 0:
-            try:
-                # [AI-2026-09-02] DB 查询放线程，避免同步 SQLite 阻塞 asyncio 事件循环
-                hedge = await asyncio.to_thread(
-                    _resolve_hedge_for_order, fund_code, underlying_symbol
-                )
-            except Exception:
-                hedge = None  # [AI-2026-08-07] SUPREME：异常也禁止 1.0 假常量
-            # 换算：ETF 股数 = LOF 份数 / hedge（与 Analysis.vue l.1123 完全一致）
-            if hedge is None or hedge <= 0:
-                # [AI-2026-08-07] 对冲系数缺失/推算失败，无法换算 ETF 数量——拒绝臆测下单，显 -- 
-                return JSONResponse(status_code=422, content={
-                    "status": "error",
-                    "message": "对冲系数 hedge 不足（缺失/推算失败），无法换算 ETF 数量，已停止下单（绝不臆测数量）"
-                })
-            etf_quantity = max(1, int(round(lof_quantity / hedge)))
-
-        if mode == "peg":
-            if direction == "close":
-                # [AI-2026-07-16] 加一分排队平仓：IB BUY LMT at bid + 0.01
-                results = lazy_trader_instance.place_peg_close_order(
-                    underlying_symbol=underlying_symbol,
-                    quantity=etf_quantity,
-                    us_bid1=price,
-                )
-            else:
-                results = lazy_trader_instance.place_peg_order(
-                    underlying_symbol=underlying_symbol,
-                    quantity=etf_quantity,
-                    us_ask1=price,
-                )
-        elif direction == "close":
-            # [AI-2026-07-16] 立即吃卖一平仓：IB BUY at ask
-            results = lazy_trader_instance.place_close_order(
-                underlying_symbol=underlying_symbol,
-                us_ask1=price,
-                etf_quantity=etf_quantity,
-            )
-        else:
-            results = lazy_trader_instance.place_open_order(
-                fund_code=fund_code,
-                underlying_symbol=underlying_symbol,
-                lof_price=lof_price,
-                us_bid1=price,
-                lof_quantity=lof_quantity,
-                etf_quantity=etf_quantity,
-            )
-        any_ok = any(r.get("success") for r in results)
-        logger.info(f"[LazyOrder] mode={mode} dir={direction} → any_ok={any_ok} results={results}")
-        return {"status": "ok" if any_ok else "error", "data": results}
-    except Exception as e:
-        logger.error(f"[LazyOrder] Error: {e}", exc_info=True)
-        return JSONResponse(status_code=500, content={"status": "error", "message": str(e)})
-
-# [AI-2026-07-15] AutoOpen: 自动排队开仓 API
-# 流程：POST /queue 排队LOF → 返回 auto_open_id → 前端轮询 /status
-#       → LOF成交后 → POST /execute 自动空ETF（或自动执行）
-_AUTO_OPEN_FILL_CHECKER = None
-_AUTO_OPEN_CHECKER_LOCK = threading.Lock()
-_AUTO_CLOSE_FILL_CHECKER = None
-_AUTO_CLOSE_CHECKER_LOCK = threading.Lock()
-
-def _start_auto_open_fill_checker(lazy_trader_instance):
-    """启动后台线程，轮询持仓检测LOF是否成交"""
-    global _AUTO_OPEN_FILL_CHECKER
-    with _AUTO_OPEN_CHECKER_LOCK:
-        if _AUTO_OPEN_FILL_CHECKER and _AUTO_OPEN_FILL_CHECKER.is_alive():
-            return
-        def _check_loop():
-            logger.info("[AutoOpen] Fill checker started")
-            while True:
-                try:
-                    if lazy_trader_instance:
-                        with lazy_trader_instance._open_lock:
-                            pending_items = list(lazy_trader_instance._pending_opens.items())
-                        for ao_id, pending in pending_items:
-                            if pending["status"] != "queued":
-                                continue
-                            # 轮询持仓变化
-                            fc = pending["fund_code"]
-                            lof_qty = pending["lof_quantity"]
-                            try:
-                                # [AI-2026-07-20] 优先用 trade_manager.query_position()（8888 短连接，
-                                # 银河/国金/通达信脚本均支持），避免 get_positions() 仅走通达信导致
-                                # 银河渠道下永远查不到持仓、自动对冲永不触发。
-                                held = 0
-                                _ts = lazy_trader_instance.trading_service
-                                _tm = getattr(_ts, 'trade_manager', None) if _ts else None
-                                if _tm and hasattr(_tm, 'query_position'):
-                                    _pos = _tm.query_position(fc)
-                                    if isinstance(_pos, dict) and _pos.get('volume'):
-                                        held = int(_pos.get('volume', 0) or 0)
-                                if held == 0 and _ts:
-                                    pos_list = _ts.get_positions()
-                                    for p in pos_list:
-                                        if p.get("code","") == fc or p.get("code","") == f"{fc}.SZ":
-                                            held = int(p.get("volume", 0) or p.get("available", 0))
-                                            break
-                                    # 如果持仓 ≥ lof_qty，说明已成交
-                                    trade_etf = ""
-                                    etf_qty = 0
-                                    # 从 fund_service 获取 ETF 信息
-                                    if lazy_trader_instance.fund_service:
-                                        meta = lazy_trader_instance.fund_service.get_valuation_meta(fc)
-                                        if meta and isinstance(meta, dict):
-                                            cfg = meta.get("fund_config", {}) or {}
-                                            trade_etf = cfg.get("trade_etf", "") or ""
-                                            # 计算 ETF 股数
-                                            bd = meta.get("base_data", {}) or {}
-                                            hedge = float(bd.get("hedge", 0) or 0)
-                                            if hedge > 0:
-                                                etf_qty = max(1, int(round(lof_qty / hedge)))
-
-                                    if held >= lof_qty and trade_etf and etf_qty > 0:
-                                        # LOF 已成交，自动执行
-                                        min_profit = pending.get("min_profit", 0.25)
-                                        result = lazy_trader_instance.auto_short_if_profitable(
-                                            ao_id, trade_etf, etf_qty, min_profit
-                                        )
-                                        status = result.get("status","")
-                                        if status == "executed":
-                                            logger.info(f"[AutoOpen] ✅ {fc} auto-open executed: {result}")
-                                        elif status == "profit_too_low":
-                                            logger.warning(f"[AutoOpen] ⚠️ {fc} filled but profit too low: {result}")
-                                        elif status == "error":
-                                            logger.error(f"[AutoOpen] ❌ {fc} auto-open failed: {result}")
-                                    elif held >= lof_qty:
-                                        logger.info(f"[AutoOpen] {fc} filled, but no trade_etf/etf_qty found, marking as filled")
-                                        # 即使没有 ETF 信息也标记为已成交
-                                        with lazy_trader_instance._open_lock:
-                                            pending["status"] = "filled"
-                                            pending["filled_at"] = datetime.now().isoformat()
-                                            pending["msg"] = "filled but no ETF info for auto-short"
-                            except Exception as e:
-                                logger.debug(f"[AutoOpen] check {fc} positions: {e}")
-                except Exception as e:
-                    logger.error(f"[AutoOpen] checker error: {e}")
-                time.sleep(3)  # 每3秒轮询
-        _AUTO_OPEN_FILL_CHECKER = threading.Thread(target=_check_loop, daemon=True)
-        _AUTO_OPEN_FILL_CHECKER.start()
-
-def _start_auto_close_fill_checker(lazy_trader_instance):
-    """启动后台线程，轮询持仓检测LOF是否已卖出（平仓）"""
-    global _AUTO_CLOSE_FILL_CHECKER
-    with _AUTO_CLOSE_CHECKER_LOCK:
-        if _AUTO_CLOSE_FILL_CHECKER and _AUTO_CLOSE_FILL_CHECKER.is_alive():
-            return
-        def _check_loop():
-            logger.info("[AutoClose] Fill checker started")
-            while True:
-                try:
-                    if lazy_trader_instance:
-                        with lazy_trader_instance._close_lock:
-                            pending_items = list(lazy_trader_instance._pending_closes.items())
-                        for ac_id, pending in pending_items:
-                            if pending["status"] != "queued":
-                                continue
-                            fc = pending["fund_code"]
-                            lof_qty = pending["lof_quantity"]
-                            initial_pos = pending.get("initial_position", 0)
-                            try:
-                                # [AI-2026-07-20] 优先用 trade_manager.query_position()（8888 短连接），
-                                # 避免 get_positions() 仅走通达信导致银河渠道下查不到持仓、自动平仓对冲不触发。
-                                current_held = initial_pos  # 默认无变化
-                                _ts = lazy_trader_instance.trading_service
-                                _tm = getattr(_ts, 'trade_manager', None) if _ts else None
-                                if _tm and hasattr(_tm, 'query_position'):
-                                    _pos = _tm.query_position(fc)
-                                    if isinstance(_pos, dict) and _pos.get('volume'):
-                                        current_held = int(_pos.get('volume', 0) or 0)
-                                if current_held == initial_pos and _ts:
-                                    pos_list = _ts.get_positions()
-                                    for p in pos_list:
-                                        if p.get("code","") == fc or p.get("code","") == f"{fc}.SZ":
-                                            current_held = int(p.get("volume", 0) or p.get("available", 0))
-                                            break
-                                    # 如果持仓减少 >= lof_qty，说明LOF已卖出
-                                    sold_qty = initial_pos - current_held
-                                    if sold_qty >= lof_qty:
-                                        trade_etf = ""
-                                        etf_qty = 0
-                                        if lazy_trader_instance.fund_service:
-                                            meta = lazy_trader_instance.fund_service.get_valuation_meta(fc)
-                                            if meta and isinstance(meta, dict):
-                                                cfg = meta.get("fund_config", {}) or {}
-                                                trade_etf = cfg.get("trade_etf", "") or ""
-                                                bd = meta.get("base_data", {}) or {}
-                                                hedge = float(bd.get("hedge", 0) or 0)
-                                                if hedge > 0:
-                                                    etf_qty = max(1, int(round(lof_qty / hedge)))
-
-                                        if sold_qty >= lof_qty and trade_etf and etf_qty > 0:
-                                            min_profit = pending.get("min_profit", -0.41)
-                                            result = lazy_trader_instance.auto_close_if_profitable(
-                                                ac_id, trade_etf, etf_qty, min_profit
-                                            )
-                                            status = result.get("status","")
-                                            if status == "executed":
-                                                logger.info(f"[AutoClose] ✅ {fc} auto-close executed: {result}")
-                                            elif status == "profit_too_low":
-                                                logger.warning(f"[AutoClose] ⚠️ {fc} sold but profit too low: {result}")
-                                            elif status == "error":
-                                                logger.error(f"[AutoClose] ❌ {fc} auto-close failed: {result}")
-                                        elif sold_qty >= lof_qty:
-                                            logger.info(f"[AutoClose] {fc} sold, but no trade_etf/etf_qty found, marking as filled")
-                                            with lazy_trader_instance._close_lock:
-                                                pending["status"] = "filled"
-                                                pending["filled_at"] = datetime.now().isoformat()
-                                                pending["msg"] = "filled but no ETF info for auto-buy"
-                            except Exception as e:
-                                logger.debug(f"[AutoClose] check {fc} positions: {e}")
-                except Exception as e:
-                    logger.error(f"[AutoClose] checker error: {e}")
-                time.sleep(3)
-        _AUTO_CLOSE_FILL_CHECKER = threading.Thread(target=_check_loop, daemon=True)
-        _AUTO_CLOSE_FILL_CHECKER.start()
-
-@app.post("/api/private/auto_open/queue")
-async def auto_open_queue(request: Request):
-    """
-    自动排队开仓：
-    1. 仅排队 LOF 买一（不操作 ETF）
-    2. 启动后台成交检测
-    3. 返回 auto_open_id 供前端轮询状态
-    """
-    global _AUTO_OPEN_FILL_CHECKER
-    if not lazy_trader_instance:
-        return JSONResponse(status_code=403, content={"status": "error", "message": "Lazy Trader not loaded"})
-    try:
-        body = await request.json()
-        fund_code = body.get("fund_code", "")
-        lof_price = float(body.get("lof_price", 0))
-        lof_quantity = int(body.get("lof_quantity", 0))
-        broker = body.get("broker", "yinhe_qmt")
-        min_profit = float(body.get("min_profit", 0.25))
-
-        if not fund_code or lof_price <= 0 or lof_quantity <= 0:
-            return JSONResponse(status_code=400, content={"status": "error", "message": "缺少必要参数"})
-
-        # 获取赎回费率
-        redemption_fee = ledger_service.get_fee_rate(fund_code, broker)
-        if redemption_fee <= 0:
-            redemption_fee = 0.50
-
-        # 获取预期利润（用当前 GLD 买一价算）
-        meta = fund_service.get_valuation_meta(fund_code)
-        rt_val = float((meta or {}).get("rt_val", 0) or 0)
-        premium = (lof_price / rt_val - 1) * 100 if rt_val > 0 else 0
-        expected_profit = round(abs(premium) - redemption_fee, 3)
-
-        # 排队 LOF
-        result = lazy_trader_instance.queue_lof_order(fund_code, lof_price, lof_quantity, broker)
-        if result.get("status") != "ok":
-            return {"status": "error", "message": "LOF下单失败", "detail": result}
-
-        auto_open_id = result["auto_open_id"]
-
-        # 保存 min_profit 到 pending 记录
-        with lazy_trader_instance._open_lock:
-            p = lazy_trader_instance._pending_opens.get(auto_open_id)
-            if p:
-                p["min_profit"] = min_profit
-
-        # 确保后台检测线程已启动
-        _start_auto_open_fill_checker(lazy_trader_instance)
-
-        return {
-            "status": "ok",
-            "auto_open_id": auto_open_id,
-            "expected_profit": expected_profit,
-            "redemption_fee": redemption_fee,
-        }
-    except Exception as e:
-        logger.error(f"[AutoOpen] queue error: {e}", exc_info=True)
-        return JSONResponse(status_code=500, content={"status": "error", "message": str(e)})
-
-@app.post("/api/private/auto_open/execute")
-async def auto_open_execute(request: Request):
-    """当 LOF 已成交，手动触发或自动触发 ETF 空单执行"""
-    if not lazy_trader_instance:
-        return JSONResponse(status_code=403, content={"status": "error", "message": "Lazy Trader not loaded"})
-    try:
-        body = await request.json()
-        auto_open_id = body.get("auto_open_id", "")
-        if not auto_open_id:
-            return JSONResponse(status_code=400, content={"status": "error", "message": "缺少 auto_open_id"})
-
-        pending = lazy_trader_instance.get_auto_open_status(auto_open_id)
-        if pending.get("status") == "not_found":
-            return JSONResponse(status_code=404, content={"status": "error", "message": "auto_open_id 不存在"})
-
-        if pending["status"] != "queued":
-            return {"status": "skipped", "message": f"当前状态 {pending['status']}，无需重复执行"}
-
-        # 获取 ETF 信息
-        fund_code = pending["fund_code"]
-        lof_qty = pending["lof_quantity"]
-        meta = fund_service.get_valuation_meta(fund_code)
-        if not meta or not isinstance(meta, dict):
-            return JSONResponse(status_code=500, content={"status": "error", "message": "无法获取基金信息"})
-        cfg = meta.get("fund_config", {}) or {}
-        trade_etf = cfg.get("trade_etf", "") or ""
-        bd = meta.get("base_data", {}) or {}
-        hedge = float(bd.get("hedge", 0) or 0)
-        etf_qty = max(1, int(round(lof_qty / hedge))) if hedge > 0 else 0
-
-        if not trade_etf or etf_qty <= 0:
-            return JSONResponse(status_code=500, content={"status": "error", "message": "无法计算ETF对冲数量"})
-
-        min_profit = pending.get("min_profit", 0.25)
-        result = lazy_trader_instance.auto_short_if_profitable(
-            auto_open_id, trade_etf, etf_qty, min_profit
-        )
-        return result
-    except Exception as e:
-        logger.error(f"[AutoOpen] execute error: {e}", exc_info=True)
-        return JSONResponse(status_code=500, content={"status": "error", "message": str(e)})
-
-@app.get("/api/private/auto_open/status/{auto_open_id}")
-async def auto_open_status(auto_open_id: str):
-    """查询排队开仓状态"""
-    if not lazy_trader_instance:
-        return JSONResponse(status_code=403, content={"status": "error", "message": "Lazy Trader not loaded"})
-    state = lazy_trader_instance.get_auto_open_status(auto_open_id)
-    if state.get("status") == "not_found":
-        return JSONResponse(status_code=404, content={"status": "error", "message": "auto_open_id 不存在"})
-    return {"status": "ok", "data": state}
-
-@app.get("/api/private/auto_open/positions/{fund_code}")
-async def auto_open_check_position(fund_code: str):
-    """查询当前持仓（用于前端判断 LOF 是否已成交）"""
-    if not trading_service:
-        return {"status": "ok", "held": 0, "msg": "trading_service not available"}
-    try:
-        pos_list = trading_service.get_positions()
-        held = 0
-        for p in pos_list:
-            if p.get("code","") == fund_code or p.get("code","") == f"{fund_code}.SZ":
-                held = int(p.get("volume", 0) or p.get("available", 0))
-                break
-        return {"status": "ok", "held": held}
-    except Exception as e:
-        return {"status": "error", "message": str(e), "held": 0}
-
-# [AI-2026-07-20] 新增：前端 preview 显示当前持仓。
-# 直接走 trade_manager.query_position（8888 短连接，银河/国金/通达信脚本均支持），
-# 不依赖 get_positions() 的通达信登录，确保银河渠道下能正确显示底仓（如 161116 持有 66800 股）。
-@app.get("/api/private/position/{fund_code}")
-async def get_fund_position(fund_code: str):
-    """查询单只基金当前持仓（优先 8888 短连接，降级 get_positions）"""
-    if not trading_service:
-        return {"status": "ok", "held": 0, "msg": "trading_service not available"}
-    try:
-        tm = getattr(trading_service, 'trade_manager', None)
-        held = 0
-        if tm and hasattr(tm, 'query_position'):
-            pos = tm.query_position(fund_code)
-            if isinstance(pos, dict) and pos.get('volume'):
-                held = int(pos.get('volume', 0) or 0)
-        if held == 0:
-            pos_list = trading_service.get_positions()
-            for p in pos_list:
-                if p.get("code", "") == fund_code or p.get("code", "") == f"{fund_code}.SZ":
-                    held = int(p.get("volume", 0) or p.get("available", 0))
-                    break
-        return {"status": "ok", "held": held}
-    except Exception as e:
-        return {"status": "error", "message": str(e), "held": 0}
-
-# [AI-2026-07-15] AutoClose: 自动排队平仓 API
-@app.post("/api/private/auto_close/queue")
-async def auto_close_queue(request: Request):
-    """
-    自动排队平仓：
-    1. 排队卖出 LOF（不操作 ETF）
-    2. 启动后台成交检测
-    3. 返回 auto_close_id 供前端轮询状态
-    """
-    global _AUTO_CLOSE_FILL_CHECKER
-    if not lazy_trader_instance:
-        return JSONResponse(status_code=403, content={"status": "error", "message": "Lazy Trader not loaded"})
-    try:
-        body = await request.json()
-        fund_code = body.get("fund_code", "")
-        lof_price = float(body.get("lof_price", 0))
-        lof_quantity = int(body.get("lof_quantity", 0))
-        broker = body.get("broker", "yinhe_qmt")
-        min_profit = float(body.get("min_profit", -0.41))
-
-        if not fund_code or lof_price <= 0 or lof_quantity <= 0:
-            return JSONResponse(status_code=400, content={"status": "error", "message": "缺少必要参数"})
-
-        # 排队卖出 LOF
-        result = lazy_trader_instance.queue_lof_close_order(fund_code, lof_price, lof_quantity, broker)
-        if result.get("status") != "ok":
-            return {"status": "error", "message": "LOF卖出下单失败", "detail": result}
-
-        auto_close_id = result["auto_close_id"]
-
-        # 保存 min_profit 到 pending 记录
-        with lazy_trader_instance._close_lock:
-            p = lazy_trader_instance._pending_closes.get(auto_close_id)
-            if p:
-                p["min_profit"] = min_profit
-
-        # 确保后台检测线程已启动
-        _start_auto_close_fill_checker(lazy_trader_instance)
-
-        return {
-            "status": "ok",
-            "auto_close_id": auto_close_id,
-        }
-    except Exception as e:
-        logger.error(f"[AutoClose] queue error: {e}", exc_info=True)
-        return JSONResponse(status_code=500, content={"status": "error", "message": str(e)})
-
-@app.post("/api/private/auto_close/execute")
-async def auto_close_execute(request: Request):
-    """当 LOF 已卖出，手动触发买回 ETF"""
-    if not lazy_trader_instance:
-        return JSONResponse(status_code=403, content={"status": "error", "message": "Lazy Trader not loaded"})
-    try:
-        body = await request.json()
-        auto_close_id = body.get("auto_close_id", "")
-        if not auto_close_id:
-            return JSONResponse(status_code=400, content={"status": "error", "message": "缺少 auto_close_id"})
-
-        pending = lazy_trader_instance.get_auto_close_status(auto_close_id)
-        if pending.get("status") == "not_found":
-            return JSONResponse(status_code=404, content={"status": "error", "message": "auto_close_id 不存在"})
-
-        if pending["status"] != "queued":
-            return {"status": "skipped", "message": f"当前状态 {pending['status']}，无需重复执行"}
-
-        fund_code = pending["fund_code"]
-        lof_qty = pending["lof_quantity"]
-        meta = fund_service.get_valuation_meta(fund_code)
-        if not meta or not isinstance(meta, dict):
-            return JSONResponse(status_code=500, content={"status": "error", "message": "无法获取基金信息"})
-        cfg = meta.get("fund_config", {}) or {}
-        trade_etf = cfg.get("trade_etf", "") or ""
-        bd = meta.get("base_data", {}) or {}
-        hedge = float(bd.get("hedge", 0) or 0)
-        etf_qty = max(1, int(round(lof_qty / hedge))) if hedge > 0 else 0
-
-        if not trade_etf or etf_qty <= 0:
-            return JSONResponse(status_code=500, content={"status": "error", "message": "无法计算ETF对冲数量"})
-
-        min_profit = pending.get("min_profit", -0.41)
-        result = lazy_trader_instance.auto_close_if_profitable(
-            auto_close_id, trade_etf, etf_qty, min_profit
-        )
-        return result
-    except Exception as e:
-        logger.error(f"[AutoClose] execute error: {e}", exc_info=True)
-        return JSONResponse(status_code=500, content={"status": "error", "message": str(e)})
-
-@app.get("/api/private/auto_close/status/{auto_close_id}")
-async def auto_close_status(auto_close_id: str):
-    """查询排队平仓状态"""
-    if not lazy_trader_instance:
-        return JSONResponse(status_code=403, content={"status": "error", "message": "Lazy Trader not loaded"})
-    state = lazy_trader_instance.get_auto_close_status(auto_close_id)
-    if state.get("status") == "not_found":
-        return JSONResponse(status_code=404, content={"status": "error", "message": "auto_close_id 不存在"})
-    return {"status": "ok", "data": state}
-
-@app.get("/api/private/lazy_status")
-async def lazy_status():
-    """Diagnostic: check LazyTrader driver status"""
-    if not lazy_trader_instance:
-        return {"status": "error", "message": "Lazy Trader not loaded"}
-    return {
-        "status": "ok",
-        "data": {
-            "ib_connected": bool(getattr(lazy_trader_instance, 'ib_reader', None) and getattr(lazy_trader_instance.ib_reader, 'connected', False)),
-            "ib_reader_exists": lazy_trader_instance.ib_reader is not None,
-            "galaxy_qmt_exists": lazy_trader_instance.galaxy_qmt is not None,
-            "guojin_qmt_exists": lazy_trader_instance.guojin_qmt is not None,
-        }
-    }
-
-# --- SmartOpenMonitor API (智能开仓/平仓监控) ---
-@app.post("/api/private/smart_monitor/start")
-async def smart_monitor_start(request: Request):
-    if not _smart_start:
-        return JSONResponse(status_code=400, content={"status": "error", "message": "SmartOpenMonitor not loaded"})
-    data = await request.json()
-    fund_code = data.get("fund_code", "")
-    direction = data.get("direction", "open")
-    target_premium = data.get("target_premium", 0)
-    lof_quantity = data.get("lof_quantity", 0)
-    trade_etf = data.get("trade_etf", "")
-    lof_broker = data.get("lof_broker", "yinhe_qmt")
-    hedge_order = data.get("hedge_order", None)  # [AI-2026-08-15] 前端选择器：lof_first / ib_first（None=按fund_config默认）
-    # [AI-2026-07-20] 前端算好的各档溢价率（与盘口表 tag 同源），后端直接使用不再自算
-    bid_premiums = data.get("bid_premiums", None)
-    ask_premiums = data.get("ask_premiums", None)
-    bid_vols = data.get("bid_vols", None)
-    ask_vols = data.get("ask_vols", None)
-    bid_prices = data.get("bid_prices", None)
-    ask_prices = data.get("ask_prices", None)
-    if not fund_code or not trade_etf or not lof_quantity:
-        return JSONResponse(status_code=400, content={"status": "error", "message": "缺少必要参数(fund_code/trade_etf/lof_quantity)"})
-    success, msg = _smart_start(
-        fund_code, direction, target_premium, lof_quantity, trade_etf, hedge_order, lof_broker,
-        bid_premiums=bid_premiums, ask_premiums=ask_premiums,
-        bid_vols=bid_vols, ask_vols=ask_vols,
-        bid_prices=bid_prices, ask_prices=ask_prices,
-        lazy_trader=_smart_lt, fund_service=_smart_fs,
-        market_data_service=_smart_mds, trading_service=_smart_ts,
-        trade_manager=getattr(_smart_ts, 'trade_manager', None) if _smart_ts else None,
-    )
-    if success:
-        return {"status": "ok", "message": msg}
-    return JSONResponse(status_code=400, content={"status": "error", "message": msg})
-
-@app.post("/api/private/smart_monitor/stop")
-async def smart_monitor_stop(request: Request):
-    if not _smart_stop:
-        return JSONResponse(status_code=400, content={"status": "error", "message": "SmartOpenMonitor not loaded"})
-    data = await request.json()
-    fund_code = data.get("fund_code", "")
-    success, msg = _smart_stop(fund_code)
-    if success:
-        return {"status": "ok", "message": msg}
-    return JSONResponse(status_code=400, content={"status": "error", "message": msg})
-
-# [AI-2026-08-15] 用户点"手动撤销美股ETF"：标记 IB 腿已接管，程序放手
-@app.post("/api/private/smart_monitor/mark_ib_taken_over")
-async def smart_monitor_mark_ib_taken_over(request: Request):
-    if not _smart_status:
-        return JSONResponse(status_code=400, content={"status": "error", "message": "SmartOpenMonitor not loaded"})
-    data = await request.json()
-    fund_code = data.get("fund_code", "")
-    from private.smart_open_monitor import get_all_monitors
-    monitors = get_all_monitors()
-    m = monitors.get(fund_code)
-    if not m:
-        return JSONResponse(status_code=400, content={"status": "error", "message": f"{fund_code} 监控器不存在"})
-    m.mark_ib_leg_user_taken_over()
-    return {"status": "ok", "message": f"{fund_code} 美股ETF腿已标记用户接管"}
-
-@app.get("/api/private/smart_monitor/status")
-async def smart_monitor_status(fund_code: str = Query(""),
-                                rt_val: float = Query(0.0),
-                                bid_premiums: str = Query(""),
-                                ask_premiums: str = Query(""),
-                                bid_vols: str = Query(""),
-                                ask_vols: str = Query(""),
-                                bid_prices: str = Query(""),
-                                ask_prices: str = Query("")):
-    # [AI-2026-08-19] Monitor 零计算：接收前端盘口算好的溢价率数组（与盘口表 100% 同源），写入 Monitor 实例。
-    # Monitor 只比较这些溢价率，不再自算 rt_val/溢价率，杜绝前后端口径分裂。
-    if fund_code:
-        try:
-            from private.smart_open_monitor import get_monitor
-            m = get_monitor(fund_code)
-            if m:
-                def _parse_prem(s):
-                    if not s:
-                        return None
-                    try:
-                        return [float(x) for x in s.split(',') if x not in ('', 'None')]
-                    except Exception:
-                        return None
-                bp = _parse_prem(bid_premiums)
-                ap = _parse_prem(ask_premiums)
-                bv = _parse_prem(bid_vols)
-                av = _parse_prem(ask_vols)
-                bpr = _parse_prem(bid_prices)
-                apr = _parse_prem(ask_prices)
-                if bp is not None:
-                    m.bid_premiums = bp
-                if ap is not None:
-                    m.ask_premiums = ap
-                # [AI-2026-08-19] 同源修复：盘口量一并写入，深度闸门优先用前端同源量（与盘口表一致）
-                if bv is not None:
-                    m.bid_vols = bv
-                if av is not None:
-                    m.ask_vols = av
-                # [AI-2026-08-20] 同源修复：盘口价格也由前端推送，Monitor 用前端深度替代后端自抓那路
-                if bpr is not None and apr is not None:
-                    m._last_depth = {'bid': bpr, 'ask': apr, 'bid_vol': (bv or []), 'ask_vol': (av or [])}
-                if rt_val and rt_val > 0:
-                    m.backend_rt_val = rt_val  # 保留兼容字段，Monitor 已不用于决策
-        except Exception:
-            pass
-    if not _smart_status:
-        return {"status": "error", "message": "SmartOpenMonitor not loaded"}
-    return _smart_status()
-
-# [AI-2026-07-23] 获取 SmartMonitor 订单历史
-@app.get("/api/private/smart_monitor/history/{direction}")
-async def smart_monitor_history(direction: str):
-    """获取指定方向的订单历史记录 (direction: open/close)"""
-    from private.smart_open_monitor import get_all_monitors
-    monitors = get_all_monitors()
-    result = {}
-    for fc, m in monitors.items():
-        if m.direction == direction:
-            result[fc] = {
-                'direction': m.direction,
-                'order_history': m.order_history[-20:],  # 最近 20 条
-            }
-    return {"status": "ok", "data": result}
-
-# [AI-2026-07-21] 运行时更新目标溢价率（不重启 Monitor）
-@app.patch("/api/private/smart_monitor/update_target")
-async def smart_monitor_update_target(request: Request):
-    if not _smart_update_target:
-        return JSONResponse(status_code=400, content={"status": "error", "message": "SmartOpenMonitor not loaded"})
-    data = await request.json()
-    fund_code = data.get("fund_code", "")
-    new_premium = data.get("target_premium", None)
-    if new_premium is None:
-        return JSONResponse(status_code=400, content={"status": "error", "message": "缺少 target_premium"})
-    success, msg = _smart_update_target(fund_code, float(new_premium))
-    if success:
-        return {"status": "ok", "message": msg}
-    return JSONResponse(status_code=400, content={"status": "error", "message": msg})
-
-# [AI-2026-10-09 东哥拍板] 删除 /api/private/lazy_simulate/{status,control} 两个端点。
-#   理由（取证结论，非推测）：
-#     ① LOFarb 前端**零调用**（全仓 grep `lazy_simulate` 只命中 api/fundApi.ts 的两个封装函数，
-#        而这两个函数自身无任何组件 import —— 死封装）；
-#     ② 该能力已由 LOFTrader 接管并**真正在用**（LOFTrader 前端 fundApi.ts 调用同一路径，
-#        后端 trading_router.py:946+ 有完整实现）。
-#   留着只会让本机多一个常驻线程 + 一条启动噪音，且给人「LOFarb 还管幽灵模拟器」的错觉。
-
-# --- Bond ETF BP Override API —— [AI-2026-10-11 东哥拍板] 整组停用（同 _BOND_MOVED，见上） ---
 @app.post("/api/bond/bp-override")
 async def set_bp_override(request: Request):
     """[已停用] 511520 手动 BP 覆盖 → 见 ETFarb"""
@@ -3112,101 +2512,16 @@ async def clear_bp_override(request: Request):
 
 
 # --- Ledger / Bookkeeping APIs ---
-@app.get("/api/ledger/trades")
-async def get_ledger_trades(status: str = 'ACTIVE'):
-    data = ledger_service.get_all_trades(status=status)
-    return {"status": "ok", "data": data}
-
-@app.post("/api/ledger/trades/add")
-async def add_ledger_trade(request: Request):
-    data = await request.json()
-    success = ledger_service.add_trade(data)
-    return {"status": "ok" if success else "error"}
-
-@app.post("/api/ledger/trades/close/{trade_id}")
-async def close_ledger_trade(trade_id: int):
-    success = ledger_service.close_trade(trade_id)
-    return {"status": "ok" if success else "error"}
-
-# --- Arbitrage Pairs (V9.2 新账本) ---
-@app.get("/api/ledger/pairs")
-async def get_ledger_pairs(status: str = None):
-    data = ledger_service.get_all_pairs(status=status)
-    return {"status": "ok", "data": data}
-
-@app.post("/api/ledger/pairs/add")
-async def add_ledger_pair(request: Request):
-    data = await request.json()
-    try:
-        pair_id = ledger_service.add_pair(data)
-        return {"status": "ok", "pair_id": pair_id}
-    except Exception as e:
-        return {"status": "error", "message": str(e)}
-
-@app.post("/api/ledger/pairs/update/{pair_id}")
-async def update_ledger_pair(pair_id: int, request: Request):
-    data = await request.json()
-    success = ledger_service.update_pair(pair_id, data)
-    return {"status": "ok" if success else "error"}
-
-@app.post("/api/ledger/pairs/delete/{pair_id}")
-async def delete_ledger_pair(pair_id: int):
-    success = ledger_service.delete_pair(pair_id)
-    return {"status": "ok" if success else "error"}
-
-# --- 赎回提醒（OPEN 笔推算可优惠赎回日 / unfinished 待净值）---
-@app.get("/api/ledger/alerts")
-async def get_ledger_alerts_api():
-    data = ledger_service.get_ledger_alerts()
-    return {"status": "ok", "data": data}
-
-@app.get("/api/ledger/floating")
-async def get_ledger_floating_api():
-    """持仓浮动跟盘：OPEN/unfinished 组实时 LOF + 美股/期货价 → 浮动盈亏。
-    [AI-2026-09-21] 沿用 A 股交易时段门禁（is_quote_window），美股 ETF 用最近收盘价（非夜盘盘中价）。"""
-    data = ledger_service.get_floating_pnl(market_data_service, holding_service, fund_service)
-    return {"status": "ok", "data": data}
-
-# --- 自动记录交易（QMT执行回调） ---
-@app.post("/api/ledger/auto-record")
-async def auto_record_trade(request: Request):
-    data = await request.json()
-    pair_id = ledger_service.auto_record_trade(data)
-    return {"status": "ok" if pair_id > 0 else "error", "pair_id": pair_id}
-
-# --- 获取昨日收盘价（默认填入买入单价） ---
 @app.get("/api/market/prev-close/{fund_code}")
 async def get_prev_close(fund_code: str):
     price = ledger_service.get_prev_close(fund_code.split('.')[0])
     return {"status": "ok", "price": price}
 
 # --- 获取券商赎回费率（自动关联填入） ---
-@app.get("/api/ledger/fee-rate")
-async def get_fee_rate(fund_code: str, broker: str = ''):
-    rate = ledger_service.get_fee_rate(fund_code, broker)
-    return {"status": "ok", "rate": rate}
-
-# --- Fee & Commission Management APIs ---
 @app.get("/api/config/fees/{code}")
 async def get_fund_fees(code: str):
     data = ledger_service.get_fund_fees(code)
     return {"status": "ok", "data": data}
-
-@app.get("/api/ledger/broker_fees")
-async def get_broker_fees():
-    data = ledger_service.get_broker_redemption_fees()
-    return {"status": "ok", "data": data}
-
-@app.post("/api/ledger/broker_fees/add")
-async def add_broker_fee(request: Request):
-    data = await request.json()
-    success = ledger_service.upsert_broker_redemption_fee(data)
-    return {"status": "ok" if success else "error"}
-
-@app.post("/api/ledger/broker_fees/delete/{fee_id}")
-async def delete_broker_fee(fee_id: int):
-    success = ledger_service.delete_broker_redemption_fee(fee_id)
-    return {"status": "ok" if success else "error"}
 
 @app.get("/api/exchange-rate")
 async def get_exchange_rate():
@@ -3215,40 +2530,6 @@ async def get_exchange_rate():
     return {"status": "ok", "rate": round(rate, 4) if rate is not None else None}
 
 # [AI-2026-08-16] 导入 v7 套利账本 Excel -> arbitrage_pairs（upsert）
-@app.post("/api/ledger/import-v7")
-async def import_v7_ledger(file: UploadFile = File(None), path: str = Form(None)):
-    """上传 v7 Excel 套利账本，解析并 upsert 到数据库。返回导入统计。
-
-    [AI-2026-08-20] 新增 path 模式：传 V7 文件绝对路径，后端直接读写该文件——
-    T 列汇率/N 列公式回填到【用户原文件】（上传模式回填写入临时文件即删，原文件永远不更新）。
-    推荐前端传 path（本地单机，后端与 V7 同机）。
-    """
-    try:
-        if path:
-            if not os.path.exists(path):
-                return {"status": "error", "message": f"V7 文件不存在: {path}"}
-            result = ledger_service.import_v7(path)
-            return {"status": "ok", "data": result}
-        import tempfile
-        content = await file.read()
-        suffix = os.path.splitext(file.filename or 'v7.xlsx')[1] or '.xlsx'
-        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
-        tmp.write(content)
-        tmp.close()
-        try:
-            result = ledger_service.import_v7(tmp.name)
-        finally:
-            try:
-                os.unlink(tmp.name)
-            except Exception:
-                pass
-        return {"status": "ok", "data": result}
-    except Exception as e:
-        import traceback
-        tb = traceback.format_exc()
-        logger.error(f"导入 v7 失败: {e}\n{tb}")
-        return {"status": "error", "message": str(e), "detail": tb}
-
 @app.post("/api/config/fees/upsert")
 async def upsert_fund_fee(request: Request):
     data = await request.json()
@@ -3256,57 +2537,6 @@ async def upsert_fund_fee(request: Request):
     return {"status": "ok" if success else "error"}
 
 # --- Trading & Position APIs ---
-@app.get("/api/trading/positions")
-async def get_trading_positions():
-    """获取真实账户持仓"""
-    try:
-        data = trading_service.get_positions()
-        return {"status": "ok", "data": data}
-    except Exception as e:
-        return JSONResponse(status_code=500, content={"status": "error", "message": str(e)})
-
-@app.get("/api/trading/balance")
-async def get_trading_balance():
-    """获取账户余额"""
-    data = trading_service.get_balance()
-    return {"status": "ok", "data": data}
-
-@app.post("/api/trading/order")
-async def place_manual_order(request: Request):
-    """手动下单接口"""
-    data = await request.json()
-    res = trading_service.execute_order(
-        action=data.get('action'),
-        code=data.get('code'),
-        volume=data.get('volume'),
-        price=data.get('price'),
-        broker=data.get('broker', 'tdx'),
-        account_id=data.get('account_id')
-    )
-    return res
-
-@app.post("/api/trading/ib_order")
-async def place_ib_order(request: Request):
-    """简单 IB 下单接口（实时沙盘用，不走 LazyTrader）"""
-    try:
-        body = await request.json()
-        action = body.get('action', 'BUY')
-        symbol = body.get('symbol', '')
-        quantity = int(body.get('quantity', 0))
-        price = float(body.get('price', 0))
-        if not symbol or quantity <= 0 or price <= 0:
-            return {"status": "error", "message": "参数不完整: symbol/quantity/price 必填"}
-        ib_reader = getattr(market_data_service, 'ib_reader', None)
-        if not ib_reader or not getattr(ib_reader, 'connected', False):
-            return {"status": "error", "message": "IB 未连接"}
-        # [AI-2026-07-02] 直接调用 ib_reader.place_us_order，不走 LazyTrader
-        success, msg = ib_reader.place_us_order(symbol, action, quantity, price)
-        logger.info(f"[IBOrder] {action} {quantity} {symbol} @ {price} -> {'OK' if success else 'FAIL'}: {msg}")
-        return {"status": "ok" if success else "error", "message": msg}
-    except Exception as e:
-        logger.error(f"[IBOrder] Error: {e}", exc_info=True)
-        return JSONResponse(status_code=500, content={"status": "error", "message": str(e)})
-
 @app.get("/api/system/accounts")
 async def get_accounts():
     """从隐私配置获取交易账号列表供前端渲染，不暴露给Git"""
@@ -3351,6 +2581,57 @@ async def save_accounts(request: Request):
         return {"status": "ok", "message": "账号保存成功，已写入隐私配置"}
     except Exception as e:
         return {"status": "error", "message": f"保存失败: {str(e)}"}
+
+# ── [AI-2026-11-14 东哥拍板] 通道按键联动：点一次，行情(8000) + 下单(8001) 都连 ──
+# 🔴 **IB 不在此列**（东哥 11-14 追加指示）：IB 经常断 / 连不上 / 收不到行情，
+#    `reconnect_ib` 与 `ib_reader.py` 一律保持原样，本文件不碰 IB 连接链路。
+#    只联动 通达信 / 银河 / 国金 三个通道。
+# 边界：本进程是纯数据/估值/看板节点。这里**只转发「连接客户端」的意图**，
+#       不挂载交易代码、不执行下单、不暴露下单端点；委托动作仍只在 8001。
+# 为何必须转发：tdx_available / xt_trader / galaxy 引用都是进程内内存对象，
+#       8000 连得再好也改不了 8001 的状态（旧代码点按钮后就卡在这个坑里）。
+LOFTRADER_CHANNEL_BASE = os.environ.get("LOFARB_TRADER_BASE", "http://127.0.0.1:8001")
+
+
+def _notify_trader(channel: str) -> dict:
+    """把「点了某通道按键」转发给 8001，让它连自己那份下单通道。
+
+    8001 未启动 / 超时 → 只降级为明确提示，**绝不阻断 8000 自己的行情连接**。
+    """
+    try:
+        import requests
+        r = requests.post(
+            f"{LOFTRADER_CHANNEL_BASE}/api/system/channel_connect",
+            json={"channel": channel}, timeout=30,
+        )
+        if r.status_code == 200:
+            return r.json()
+        return {"status": "error", "ready": False,
+                "message": f"8001 返回 HTTP {r.status_code}"}
+    except Exception as e:
+        return {"status": "error", "ready": False,
+                "message": f"LOFTrader(8001) 未响应：{e}（下单侧未就绪，行情侧不受影响）"}
+
+
+def _attach_trade_side(payload: dict, channel: str) -> dict:
+    """把 8001 下单侧结果并进返回体与里程碑，杜绝「绿灯但下不了单」的假象。
+
+    ⚠️ 刻意**不改** payload['status']：它仍表示 8000 行情侧结果，
+       避免破坏 006_1 已验证的 IB 流程（点标签→变绿→等 15–30s 热身）。
+       下单侧是否就绪看 trade_side.ready / message / 侧栏里程碑。
+    """
+    t = _notify_trader(channel)
+    ready = bool(t.get("ready"))
+    note = (f"[下单侧/{channel}] " + ("就绪" if ready else "未就绪")
+            + f"：{t.get('message', '')}")
+    payload["trade_side"] = {
+        "channel": channel, "ready": ready,
+        "status": t.get("status"), "message": t.get("message"),
+    }
+    payload["message"] = f"{payload.get('message', '')} | {note}"
+    system_status.add_milestone("SUCCESS" if ready else "WARNING", note)
+    return payload
+
 
 @app.post("/api/system/reconnect_ib")
 async def reconnect_ib():
@@ -3416,107 +2697,57 @@ async def reconnect_futu():
         system_status.add_milestone("ERROR", f"富途重连异常: {e}")
         return {"status": "error", "message": str(e)}
 
-@app.post("/api/system/debug_tdx_order")
-async def debug_tdx_order():
-    """[调试保留 2026-09-03] 隔离 Monitor，直接走 tdx 通道下指定单，验证 tdx 下单能力。
-    固定下 162411 买入 100股 @1.001。用于排查「Monitor 走 yinhe_qmt 报错」与 tdx 通道本身是否报错的区别。
-    ★ 调试保留端点（见 docs/012_1）：每次调用会下一笔 162411@1.001 测试单，慎用于正式环境。"""
-    tm = getattr(_smart_ts, 'trade_manager', None) if _smart_ts else None
-    if not tm:
-        return {"status": "error", "message": "trade_manager 不可用"}
-    if not getattr(tm, 'tdx_available', False):
-        return {"status": "error", "message": "通达信接口未就绪(tdx_available=False)，请先点「通达信」按键初始化"}
-    try:
-        ok, msg = tm.send_order(broker='tdx', action='BUY', symbol='162411', volume=100, price=1.001)
-        # 增强：下单后查当日委托，确认委托编号与状态（Monitor 撤单/成交追踪依赖此字段）
-        orders = []
-        if ok and hasattr(tm, 'query_tdx_orders'):
-            try:
-                orders = tm.query_tdx_orders('162411') or []
-            except Exception as e:
-                orders = [f"query_tdx_orders 异常: {e}"]
-        return {
-            "status": "ok" if ok else "fail",
-            "message": msg,
-            "tdx_available": tm.tdx_available,
-            "last_tdx_order_id": getattr(tm, 'last_tdx_order_id', ''),
-            "tdx_orders_162411": orders
-        }
-    except Exception as e:
-        import traceback
-        return {"status": "exception", "message": str(e), "trace": traceback.format_exc()}
-
-
-@app.post("/api/system/debug_tdx_query")
-async def debug_tdx_query(code: str = '162411'):
-    """[调试保留 2026-09-03] 只读查询通达信当日委托，不下一笔新单。
-    用于验证某基金委托编号(Wtbh)/状态（如下单后点「确认」委托编号是否补全）。
-    需先点「通达信」按键初始化 tdx 通道。★ 安全：只读，不触发任何下单。"""
-    tm = getattr(_smart_ts, 'trade_manager', None) if _smart_ts else None
-    if not tm:
-        return {"status": "error", "message": "trade_manager 不可用"}
-    if not getattr(tm, 'tdx_available', False):
-        return {"status": "error", "message": "通达信接口未就绪(tdx_available=False)，请先点「通达信」按键初始化"}
-    try:
-        orders = tm.query_tdx_orders(code) or []
-        return {"status": "ok", "code": code, "tdx_available": tm.tdx_available, "orders": orders}
-    except Exception as e:
-        import traceback
-        return {"status": "exception", "message": str(e), "trace": traceback.format_exc()}
-
-
 @app.post("/api/system/reconnect_tdx")
 async def reconnect_tdx():
-    """重连通达信 - 使用 reconnect() 方法，试连 3 次。
-    [2026-09-02] 同时按需连接通达信交易通道(tqcenter)：点按键才连，启动时不再硬连（与银河QMT按键模式一致）。"""
+    """[AI-2026-11-14] 点「通达信」：8000 重连 tdx 行情源 + 联动 8001 的 tqcenter 交易通道。
+
+    行情重连部分取回自备份 main.py.bak-20261114:3468；原实现里
+    `_smart_ts.trade_manager._init_tdx()` 在剥离后 _smart_ts 零定义、根本跑不到，
+    交易侧改由 8001 的 `/api/system/channel_connect` 承担。
+    ⚠️ 8000 仍不含任何下单代码；_init_tdx() 只在 8001 进程内发生。
+    """
+    return _attach_trade_side(_reconnect_tdx_local(), "tdx")
+
+
+def _reconnect_tdx_local():
+    """8000 行情侧重连通达信 fetcher（同步，沿用原实现语义）。"""
     try:
-        # [2026-09-02] 交易通道(tqcenter)按需连接：点「通达信」按键才初始化，启动时不连
-        tm = getattr(_smart_ts, 'trade_manager', None) if _smart_ts else None
-        trade_note = ''
-        if tm and hasattr(tm, '_init_tdx'):
-            try:
-                tm._init_tdx()
-                trade_note = '交易通道已就绪' if tm.tdx_available else '交易通道未就绪(请确认通达信交易软件已开并登录)'
-            except Exception as e:
-                trade_note = f'交易通道初始化异常: {e}'
-        if market_data_service.realtime_manager:
-            rm = market_data_service.realtime_manager
-            tdx = rm.active_fetchers.get('tdx')
-            if tdx:
-                # 已在 active_fetchers 中，直接 reconnect
-                success, msg = tdx.reconnect()
-                combined = f"{msg} | {trade_note}"
-                if success:
-                    system_status.add_milestone("SUCCESS", combined)
-                    return {"status": "ok", "message": combined}
-                else:
-                    system_status.add_milestone("WARNING", combined)
-                    return {"status": "error", "message": combined}
-            else:
-                # V10.0 启动时跳过了客户端源，需要新创建实例并注册
-                from arbcore.fetchers.realtime.tdx import TdxRealtimeFetcher
-                tdx = TdxRealtimeFetcher()
-                success, msg = tdx.reconnect()
-                combined = f"{msg} | {trade_note}"
-                if success:
-                    rm.active_fetchers['tdx'] = tdx
-                    if rm.symbols:
-                        tdx.subscribe(rm.symbols)
-                    system_status.add_milestone("SUCCESS", f"通达信 {combined}")
-                    return {"status": "ok", "message": combined}
-                else:
-                    system_status.add_milestone("WARNING", f"通达信 {combined}")
-                    return {"status": "error", "message": combined}
-        else:
+        if not market_data_service.realtime_manager:
             system_status.add_milestone("WARNING", "实时行情管理器未启动")
             return {"status": "error", "message": "实时行情管理器未启动"}
+        rm = market_data_service.realtime_manager
+        tdx = rm.active_fetchers.get('tdx')
+        if tdx:
+            success, msg = tdx.reconnect()
+            if success:
+                system_status.add_milestone("SUCCESS", f"通达信行情 {msg}")
+                return {"status": "ok", "message": msg}
+            system_status.add_milestone("WARNING", f"通达信行情 {msg}")
+            return {"status": "error", "message": msg}
+        # V10.0 启动时跳过了客户端源，需要新创建实例并注册
+        from arbcore.fetchers.realtime.tdx import TdxRealtimeFetcher
+        tdx = TdxRealtimeFetcher()
+        success, msg = tdx.reconnect()
+        if success:
+            rm.active_fetchers['tdx'] = tdx
+            if rm.symbols:
+                tdx.subscribe(rm.symbols)
+            system_status.add_milestone("SUCCESS", f"通达信行情 {msg}")
+            return {"status": "ok", "message": msg}
+        system_status.add_milestone("WARNING", f"通达信行情 {msg}")
+        return {"status": "error", "message": msg}
     except Exception as e:
-        system_status.add_milestone("ERROR", f"通达信重连异常: {e}")
+        system_status.add_milestone("ERROR", f"通达信行情重连异常: {e}")
         return {"status": "error", "message": str(e)}
 
 @app.post("/api/system/reconnect_galaxy")
 async def reconnect_galaxy():
-    """银河QMT仅用于下单，不参与行情轮询"""
+    """[AI-2026-11-14] 点「银河QMT」：8000 注册行情侧引用 + 联动 8001 下单侧探测。"""
+    return _attach_trade_side(_reconnect_galaxy_local(), "galaxy")
+
+
+def _reconnect_galaxy_local():
+    """银河QMT仅用于下单，不参与行情轮询（8000 侧，原逻辑未改）"""
     try:
         if not market_data_service.realtime_manager:
             system_status.add_milestone("WARNING", "实时行情管理器未启动")
@@ -3533,15 +2764,10 @@ async def reconnect_galaxy():
             rm.active_fetchers['galaxy'] = galaxy
             success, msg = galaxy.reconnect()
         if success:
-            # 更新 lazy trader 的下单通道引用
-            global lazy_trader_instance
-            if lazy_trader_instance is not None:
-                lazy_trader_instance.inject_drivers(
-                    ib_reader=getattr(market_data_service, 'ib_reader', None),
-                    galaxy_qmt=galaxy,
-                    guojin_qmt=rm.active_fetchers.get('guojin')
-                )
-            logger.info("[银河QMT] 下单通道正常，已注册active_fetchers (不参与行情轮询)")
+            # [AI-2026-11-14] 剥离后 8000 侧 lazy_trader_instance 恒 None，
+            # 原来的 inject_drivers(...) 是死代码 —— 点了只把标签点亮，实际下不了单。
+            # 已移除；下单侧由 8001 的 /api/system/channel_connect 接管。
+            logger.info("[银河QMT] 8000 行情侧注册完成；下单侧结果见 trade_side")
             system_status.add_milestone("SUCCESS", "银河QMT下单通道正常 (不参与行情)")
             return {"status": "ok", "message": "银河QMT下单通道正常"}
         else:
@@ -3554,7 +2780,12 @@ async def reconnect_galaxy():
 
 @app.post("/api/system/reconnect_guojin")
 async def reconnect_guojin():
-    """重连国金QMT - 使用 reconnect() 方法，试连 3 次"""
+    """[AI-2026-11-14] 点「国金QMT」：8000 重连行情 fetcher + 联动 8001 按需连 xtquant 下单通道。"""
+    return _attach_trade_side(_reconnect_guojin_local(), "guojin")
+
+
+def _reconnect_guojin_local():
+    """重连国金QMT - 使用 reconnect() 方法，试连 3 次（8000 行情侧，原逻辑未改）"""
     try:
         if market_data_service.realtime_manager:
             rm = market_data_service.realtime_manager
@@ -3718,92 +2949,6 @@ async def get_data_status():
 # [AI-2026-08-22] 旧版文件型信号监测引擎端点已废弃删除（single source of truth = DB 驱动 rule_engine）
 
 # --- [AI-2026-07-01] RuleEngine API (DB驱动，LazyMode 前端用) ---
-@app.get("/api/rule_engine/status")
-async def get_rule_engine_status():
-    if not rule_engine:
-        return {"status": "error", "message": "RuleEngine not loaded", "running": False, "rules": []}
-    rules = rule_engine.get_all_rules()
-    # [AI-2026-08-23] 返回交易数量配置，供前端展示每笔LOF/ETF数量
-    qty_map = rule_engine.get_all_trade_configs()
-    return {"status": "ok", "running": rule_engine.running, "rules": rules, "trigger_qty": qty_map}
-
-# [AI-2026-08-23] 保存基金交易数量配置
-@app.post("/api/rule_engine/trade_config")
-async def save_trade_config(request: Request):
-    if not rule_engine:
-        return JSONResponse(status_code=400, content={"status": "error", "message": "RuleEngine not loaded"})
-    data = await request.json()
-    fund_code = data.get("fund_code")
-    lof_qty = int(data.get("lof_qty", 10000))
-    etf_qty = int(data.get("etf_qty", 60))
-    if not fund_code:
-        return JSONResponse(status_code=400, content={"status": "error", "message": "Missing fund_code"})
-    ok = rule_engine.save_trade_config(fund_code, lof_qty, etf_qty)
-    return {"status": "ok" if ok else "error"}
-
-@app.post("/api/rule_engine/toggle")
-async def toggle_rule_engine(request: Request):
-    if not rule_engine:
-        return JSONResponse(status_code=400, content={"status": "error", "message": "RuleEngine not loaded"})
-    data = await request.json()
-    action = data.get("action")
-    if action == "start":
-        rule_engine.start()
-        return {"status": "ok", "running": True}
-    elif action == "stop":
-        rule_engine.stop()
-        return {"status": "ok", "running": False}
-    return JSONResponse(status_code=400, content={"status": "error", "message": "Invalid action"})
-
-@app.post("/api/rule_engine/rule_add")
-async def add_rule_engine_rule(request: Request):
-    if not rule_engine:
-        return JSONResponse(status_code=400, content={"status": "error", "message": "RuleEngine not loaded"})
-    data = await request.json()
-    # 自动映射 hedge_symbol
-    fund_code = data.get("fund_code", "")
-    hedge = data.get("hedge_symbol", "")
-    if not hedge:
-        hedge = rule_engine._lookup_hedge(fund_code)
-    result = rule_engine.add_rule({
-        "fund_code": fund_code,
-        "hedge_symbol": hedge,
-        "direction": data.get("direction", "open"),
-        "condition": data.get("condition", "lt"),
-        "threshold": data.get("threshold", -0.5),
-        "pos_constraint": data.get("pos_constraint"),
-        "pos_value": data.get("pos_value"),
-        "cash_constraint": data.get("cash_constraint"),
-        "cash_value": data.get("cash_value"),
-        "enabled": data.get("enabled", True),
-        "note": data.get("note", ""),
-    })
-    return result
-
-@app.post("/api/rule_engine/rule_update/{rule_id}")
-async def update_rule_engine_rule(rule_id: int, request: Request):
-    if not rule_engine:
-        return JSONResponse(status_code=400, content={"status": "error", "message": "RuleEngine not loaded"})
-    data = await request.json()
-    success = rule_engine.update_rule(rule_id, data)
-    return {"status": "ok" if success else "error"}
-
-@app.delete("/api/rule_engine/rule/{rule_id}")
-async def delete_rule_engine_rule(rule_id: int):
-    if not rule_engine:
-        return JSONResponse(status_code=400, content={"status": "error", "message": "RuleEngine not loaded"})
-    rule_engine.delete_rule(rule_id)
-    return {"status": "ok"}
-
-@app.get("/api/rule_engine/logs")
-async def get_rule_engine_logs():
-    if not rule_engine:
-        return {"status": "ok", "logs": []}
-    return {"status": "ok", "logs": rule_engine.get_recent_logs()}
-
-# [AI-2026-08-22] SignalDetector 端点已废弃删除（唯一策略引擎 = DB 驱动 rule_engine，端点见上方 /api/rule_engine/*）
-
-# --- Data Source Config APIs ---
 @app.get("/api/config/data_sources")
 async def get_data_sources(module: str = "realtime_market"):
     data = config_service.get_data_sources(module)
