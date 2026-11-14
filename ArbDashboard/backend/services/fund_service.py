@@ -3828,6 +3828,11 @@ DailyUpdater()._step4_fetch_prices()
 
             result = {
                 "status": "ok",
+                # [AI-2026-11-14 东哥需求] 补 fund_name：Smart 下单页标题要显示「嘉实标普石油」，
+                #   与主看板「名称」列一致。原来接口不返回名字，前端只能 fallback 用代码，
+                #   标题就变成 "159518 (159518)" 两遍。
+                #   f_row[0] 即 3462 处 SELECT 出的 fund_name，此前查出但未使用。
+                "fund_name": str(f_row[0] or '').strip(),
                 "fund_config": fund_cfg,
                 "base_data": formatted_base_data,
                 "t1_data": t1_data,

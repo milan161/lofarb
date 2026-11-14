@@ -299,25 +299,45 @@ class DashboardSnapshotService:
             elif watchlist:
                 # [AI-2026-08-16] 优先取专用 watchlist 快照；若不存在(周末/重启后门禁未生成)，
                 # fallback 到从各分类缓存快照中按 fund_code 过滤，避免"我的自选"在非交易日显示空白。
+                #
+                # [AI-2026-11-14 修 BUG·两层] 东哥实测「我的自选」时好时坏，查下来是两个问题叠加：
+                #   BUG-1 原逻辑只要 watchlist 快照存在就**无条件 return**，哪怕过滤后是空
+                #         （?watchlist=164824 → 0 条，但全量 52 条里有它）。
+                #   BUG-2 只修"为空才兜底"仍不够：专用快照的基金池只覆盖部分自选
+                #         （实测 ?watchlist=164824,159502,159985,513000 → 只回 2 只，缺 159502/513000）。
+                #   ⇒ 改为「按缺失补齐」：先从专用快照取，缺的那几只再从各分类快照里捞。
+                allowed = set(watchlist)
+                found = []
                 snapshot = self._snapshots.get("watchlist")
                 if snapshot:
-                    result = dict(snapshot)
-                    allowed = set(watchlist)
-                    result["data"] = [item for item in result.get("data", []) if item.get("fund_code") in allowed]
-                    result["key"] = "watchlist_request"
-                    return result
-                # fallback: 从分类快照聚合 + 按 watchlist 过滤
-                allowed = set(watchlist)
-                combined = []
+                    found = [item for item in snapshot.get("data", []) if item.get("fund_code") in allowed]
+                    missing = allowed - {it.get("fund_code") for it in found}
+                    if not missing:
+                        # 专用快照已覆盖全部请求 → 直接用它（保留其 updated_at 口径）
+                        result = dict(snapshot)
+                        result["data"] = found
+                        result["key"] = "watchlist_request"
+                        return result
+                else:
+                    missing = set(allowed)
+                # fallback / 补齐：从分类快照聚合，只补 missing 的部分（避免与 found 重复）
+                combined = list(found)
                 latest_updated = None
                 for cat in ALL_CATEGORIES:
                     snap = self._snapshots.get(cat)
                     if snap and snap.get("data"):
                         for item in snap["data"]:
-                            if item.get("fund_code") in allowed:
+                            code = item.get("fund_code")
+                            if code in missing:
                                 combined.append(item)
+                                missing.discard(code)
                         if snap.get("updated_at") and (not latest_updated or snap["updated_at"] > latest_updated):
                             latest_updated = snap["updated_at"]
+                if missing:
+                    logger.warning(
+                        "[SNAPSHOT] 自选中有 %d 只不在任何分类快照内: %s（可能估值失败或已停更）",
+                        len(missing), sorted(missing),
+                    )
                 if combined:
                     return {
                         "data": combined,
