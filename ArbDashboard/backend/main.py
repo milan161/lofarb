@@ -2583,12 +2583,14 @@ async def save_accounts(request: Request):
         return {"status": "error", "message": f"保存失败: {str(e)}"}
 
 # ── [AI-2026-11-14 东哥拍板] 通道按键联动：点一次，行情(8000) + 下单(8001) 都连 ──
-# 🔴 **IB 不在此列**（东哥 11-14 追加指示）：IB 经常断 / 连不上 / 收不到行情，
-#    `reconnect_ib` 与 `ib_reader.py` 一律保持原样，本文件不碰 IB 连接链路。
-#    只联动 通达信 / 银河 / 国金 三个通道。
+# 四个通道（通达信 / 银河 / 国金 / IB）都联动。
+# 🔴 IB 特殊：006_1 已验证的流程是「点标签 → 变绿 → 等 15–30s 订阅热身」，
+#    且 `reconnect_ib` 本身同步阻塞，故 IB 一律用**异步 fire-and-forget** 通知 8001：
+#    不改返回体、不加里程碑、不阻塞按钮、不碰 `reconnect()` 主体。
+#    `arbcore/fetchers/ib_reader.py` 仍是零改动（看门狗 / OVERNIGHT / 订阅池全不动）。
 # 边界：本进程是纯数据/估值/看板节点。这里**只转发「连接客户端」的意图**，
 #       不挂载交易代码、不执行下单、不暴露下单端点；委托动作仍只在 8001。
-# 为何必须转发：tdx_available / xt_trader / galaxy 引用都是进程内内存对象，
+# 为何必须转发：tdx_available / xt_trader / ib_reader.connected 都是进程内内存对象，
 #       8000 连得再好也改不了 8001 的状态（旧代码点按钮后就卡在这个坑里）。
 LOFTRADER_CHANNEL_BASE = os.environ.get("LOFARB_TRADER_BASE", "http://127.0.0.1:8001")
 
@@ -2611,6 +2613,25 @@ def _notify_trader(channel: str) -> dict:
     except Exception as e:
         return {"status": "error", "ready": False,
                 "message": f"LOFTrader(8001) 未响应：{e}（下单侧未就绪，行情侧不受影响）"}
+
+
+def _notify_trader_async(channel: str) -> None:
+    """[AI-2026-11-14] fire-and-forget：把「点了 IB」通知 8001，绝不阻塞 8000 响应。
+
+    006_1 已验证的 IB 流程是「点标签 → 变绿 → 等 15–30s 订阅热身」。
+    `reconnect_ib` 本身同步跑 3 次试连（每次含 2s sleep），若再**同步** POST
+    8001（它自己的 reconnect() 同样阻塞），很容易撞上前端 15s axios 超时，
+    把按钮打断 —— 这正是 006_1 里富途端点当年改异步的原因。
+    ⇒ 只起 daemon 线程发通知；8001 不在线 / 连不上只记日志，行情侧完全不受影响。
+    """
+    def _send():
+        try:
+            r = _notify_trader(channel)
+            logger.info("[IB联动] 8001 下单侧: %s", r.get("message", ""))
+        except Exception as e:
+            logger.info("[IB联动] 8001 下单侧通知失败（行情侧不受影响）: %s", e)
+
+    threading.Thread(target=_send, daemon=True, name=f"notify-trader-{channel}").start()
 
 
 def _attach_trade_side(payload: dict, channel: str) -> dict:
@@ -2643,6 +2664,7 @@ async def reconnect_ib():
             success, msg = market_data_service.ib_reader.reconnect()
             if success:
                 system_status.add_milestone("SUCCESS", msg)
+                _notify_trader_async("ib")   # 只通知，不改返回体 / 不阻塞
                 return {"status": "ok", "message": msg}
             else:
                 system_status.add_milestone("WARNING", msg)
@@ -2654,6 +2676,7 @@ async def reconnect_ib():
             success, msg = reader.reconnect()
             if success:
                 system_status.add_milestone("SUCCESS", msg)
+                _notify_trader_async("ib")   # 只通知，不改返回体 / 不阻塞
                 return {"status": "ok", "message": msg}
             else:
                 system_status.add_milestone("WARNING", msg)
