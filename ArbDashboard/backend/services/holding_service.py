@@ -1804,6 +1804,21 @@ class HoldingService:
         }
 
     @staticmethod
+    def _sina_quote_time(fields: list[str]) -> str:
+        """从新浪 hf_ 期货逗号串取真实行情时间，返回 'YYYY-MM-DD HH:MM:SS'。
+
+        [AI-2026-11-16] 新浪 hf_CL 实测 15 字段：[0]现价、[6]时间、[12]日期、[13]名称、
+        [14]恒为 0（保留位）。旧实现取 fields[-1] 当时间 ⇒ 三基金对比弹窗 CL 实时价
+        下方恒显 "0"（纯显示 bug，不影响价格/估值）。字段缺失或格式不符返回 ''，不造数。
+        """
+        if len(fields) >= 13:
+            tm = fields[6].strip()
+            dt = fields[12].strip()
+            if re.fullmatch(r"\d{2}:\d{2}:\d{2}", tm):
+                return f"{dt} {tm}" if re.fullmatch(r"\d{4}-\d{2}-\d{2}", dt) else tm
+        return ""
+
+    @staticmethod
     def _fetch_cl_realtime(contract: str, max_retry: int = 3) -> Any:
         """实时抓指定远月合约 CL(WTI) 价（新浪 hf_CL{contract}，如 hf_CL2611）。与 cl_freeze_sampler.fetch_cl 同源。
 
@@ -1840,7 +1855,7 @@ class HoldingService:
                         continue
                 if price is None:
                     raise ValueError(f"新浪 {code} 无有效价格")
-                t = fields[-1].strip() if fields else ""
+                t = HoldingService._sina_quote_time(fields)
                 return price, t
             except Exception as e:
                 last_err = e

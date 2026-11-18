@@ -251,6 +251,21 @@ def is_trading_day(d: datetime) -> bool:
 
 
 # ---------- 行情抓取 ----------
+def sina_quote_time(fields: list[str]) -> str:
+    """从新浪 hf_ 期货逗号串取真实行情时间，返回 'YYYY-MM-DD HH:MM:SS'。
+
+    [AI-2026-11-16] 新浪 hf_CL 实测 15 字段：[0]现价、[6]时间、[12]日期、[13]名称、
+    [14]恒为 0（保留位）。旧实现取 fields[-1] 当时间 ⇒ 恒得 "0"。字段缺失或格式
+    不符返回 ''，不造数（与 holding_service.py 的同名解析保持一致）。
+    """
+    if len(fields) >= 13:
+        tm = fields[6].strip()
+        dt = fields[12].strip()
+        if re.fullmatch(r"\d{2}:\d{2}:\d{2}", tm):
+            return f"{dt} {tm}" if re.fullmatch(r"\d{4}-\d{2}-\d{2}", dt) else tm
+    return ""
+
+
 def fetch_cl(contract: str) -> tuple[float, str]:
     """抓取单个远月合约（如 2611）新浪 hf_CL2611 价格。返回 (price, sina_time)。"""
     code = sina_code(contract)
@@ -274,7 +289,7 @@ def fetch_cl(contract: str) -> tuple[float, str]:
             continue
     if price is None:
         raise ValueError(f"新浪 {code} 未解析出有效价格")
-    t = fields[-1].strip() if fields else ""
+    t = sina_quote_time(fields)
     return price, t
 
 

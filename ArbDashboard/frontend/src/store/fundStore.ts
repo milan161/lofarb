@@ -89,7 +89,7 @@ export const useFundStore = defineStore('fund', () => {
   const intradayData = ref<any[]>([])
   const basketData = ref<any[]>([])
 
-  // ---- watchlist（DB 化为唯一真源；见 ARM_LOCAL_FAILOVER.md §1.1：B 类用户选择，本地权威上推 ARM）----
+  // ---- watchlist（DB 化为唯一真源；见 全站主备说明.md §1.1：B 类用户选择，本地权威上推 ARM）----
   const watchlist = ref<string[]>([])
   let watchlistInitialized = false
   async function loadWatchlist() {
