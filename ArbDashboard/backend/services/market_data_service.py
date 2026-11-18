@@ -54,8 +54,21 @@ class MarketDataService:
         else:
             try:
                 # [V10.0] IBReader 启动时不自动连接，用户点击页面"IB"按钮才重连
-                self.ib_reader = IBReader(db_manager=db_manager)
-                logger.info("IB Reader 已初始化，待用户手动连接")
+                # [2026-11-18 东哥明确授权，红线文件唯一例外] 允许用环境变量 LOFT_IB_CLIENT_ID 固定 client_id。
+                #   事故背景：8001(下单侧) 与 8000(行情侧) 各自随机取 1000–9999 的 client_id
+                #   （ib_reader.py:111），2026-11-18 出现「Gateway 面板 API Client=2 已连接，但 8001 自认未连接」
+                #   —— 8001 的旧 socket 被网关卡住成僵尸，占住它自己的 client_id，之后每次重连都按
+                #   「同一 ID 重复连接」(Error 326) 被拒，重试 3 次全失败且错误被 connect_to_ib 吞掉。
+                #   修法：让需要稳定的进程显式固定 id，且【刻意取在随机区间 1000–9999 之外】永不相撞：
+                #     LOFTrader(8001 下单侧) 设 LOFT_IB_CLIENT_ID=1；LOFarb(8000 行情侧) 建议设 =2。
+                #   不设该变量则完全维持原行为（随机 1000–9999），向后兼容、不影响 ARM/看板等其它部署。
+                _ib_cid = os.environ.get('LOFT_IB_CLIENT_ID', '').strip()
+                self.ib_reader = IBReader(
+                    client_id=(int(_ib_cid) if _ib_cid.isdigit() else None),
+                    db_manager=db_manager,
+                )
+                logger.info("IB Reader 已初始化（client_id=%s，待用户手动连接）",
+                            getattr(self.ib_reader, 'client_id', '?'))
             except Exception as e:
                 logger.warning(f"IB Reader 初始化失败: {e}")
                 self.ib_reader = None
