@@ -38,8 +38,11 @@ LOCAL_DB = _resolve_db_path()
 # ARM 端分时主库绝对路径（ssh 内联命令直连，避免 SCP 整库超时）
 ARM_REMOTE_DB = '/home/ubuntu/arbtest/database/arb_master.db'
 
-# 关注基金：仅这 5 只做分时同步（与 H5 intradayCodes 一致；2026-11-13 扩 513350/159518 两只 XOP 跟踪 ETF）
-ARM_SYNC_FUNDS = ['162411', '164701', '161116', '513350', '159518']
+# 关注基金：仅这些做分时同步（与 H5 intradayCodes 一致；2026-11-13 扩 513350/159518 两只 XOP 跟踪 ETF；2026-11-20 扩 161127 XBI 跟踪 LOF）
+# [AI-2026-11-21 东哥拍板 B] 扩三只原油基金（160723/161129/501018），走 hrv/CL 链路，
+# 分时数据由 ARM sampler 落库后同步回本机供折溢价曲线展示。
+ARM_SYNC_FUNDS = ['162411', '164701', '161116', '513350', '159518', '161127',
+                  '160723', '161129', '501018']
 
 # 与 fund_intraday_quotes 表列顺序严格一致（SELECT 与本地 INSERT 共用）
 _INTRADAY_COLS = [

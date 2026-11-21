@@ -1,0 +1,132 @@
+{
+  "_description": "基金季报持仓名称 → symbol/region/currency 等元数据映射。原油 LOF 常见底层 ETF/ETC/股票。键名用季报披露名的『可子串匹配核心』（parser 用双向子串匹配，见 parse_jsfund_pdf._match_name_meta）。新增标的时务必把 symbol 填实（留 null 会写空 symbol，下游 holding_static_val 会因无价把它剔除）。",
+  "_note_03175_currency": "03175 价格源是腾讯 hk03175(HKD)、FX 走 hkd_cny_mid，故 currency=HKD；DB 历史行曾混用 USD/HKD，如估值口径要改须同步 holding_service.CURRENCY_FX_COL。",
+  "mappings": {
+    "WisdomTree WTI Crude Oil": {
+      "symbol": "CRUD",
+      "region": "UK",
+      "currency": "USD",
+      "type": "ETC",
+      "manager": "WisdomTree Multi Asset Issuer Plc"
+    },
+    "WisdomTree Brent Crude Oil (Trading Currency-USD)": {
+      "symbol": "BRNT",
+      "region": "UK",
+      "currency": "USD",
+      "type": "ETC",
+      "manager": "WisdomTree Multi Asset Issuer Plc"
+    },
+    "WisdomTree Brent Crude Oil (Trading Currency-GBP)": {
+      "symbol": "BRNG",
+      "region": "UK",
+      "currency": "GBP",
+      "type": "ETC",
+      "manager": "WisdomTree Multi Asset Issuer Plc"
+    },
+    "WisdomTree Brent Crude Oil": {
+      "symbol": "BRNT",
+      "region": "UK",
+      "currency": "USD",
+      "type": "ETC",
+      "manager": "WisdomTree Multi Asset Issuer Plc"
+    },
+    "United States Oil Fund LP": {
+      "symbol": "USO",
+      "region": "US",
+      "currency": "USD",
+      "type": "ETF",
+      "manager": "United States Commodity Funds LLC"
+    },
+    "United States Brent Oil Fund LP": {
+      "symbol": "BNO",
+      "region": "US",
+      "currency": "USD",
+      "type": "ETF",
+      "manager": "United States Commodity Funds LLC"
+    },
+    "ProShares K-1 Free Crude Oil ETF": {
+      "symbol": "OILK",
+      "region": "US",
+      "currency": "USD",
+      "type": "ETF",
+      "manager": "ProShare Advisors LLC"
+    },
+    "State Street Energy Select Sector SPDR ETF": {
+      "symbol": "XLE",
+      "region": "US",
+      "currency": "USD",
+      "type": "ETF",
+      "manager": "SSgA Funds Management Inc"
+    },
+    "Invesco DB Oil Fund": {
+      "symbol": "DBO",
+      "region": "US",
+      "currency": "USD",
+      "type": "ETF",
+      "manager": "Invesco Capital Management LLC"
+    },
+    "Simplex WTI": {
+      "symbol": "1671",
+      "region": "JP",
+      "currency": "JPY",
+      "type": "ETF",
+      "manager": "Simplex Asset Management Co Ltd"
+    },
+    "NEXT FUNDS NOMURA Crude Oil Long Index": {
+      "symbol": "1699",
+      "region": "JP",
+      "currency": "JPY",
+      "type": "ETF",
+      "manager": "Nomura Asset Management Co Ltd"
+    },
+    "UBS CMCI Oil SF": {
+      "symbol": "OILUSA",
+      "region": "CH",
+      "currency": "USD",
+      "type": "ETF",
+      "manager": "UBS Fund Management Switzerland AG"
+    },
+    "Collateralized ETC on Brent Crude Oil": {
+      "symbol": "BNQA",
+      "region": "DE",
+      "currency": "EUR",
+      "type": "ETC",
+      "manager": "BNP Paribas SA"
+    },
+    "Samsung S&P GSCI Crude Oil ER": {
+      "symbol": "03175",
+      "region": "HK",
+      "currency": "HKD",
+      "type": "ETF",
+      "manager": "Samsung Asset Management HK Ltd"
+    },
+    "CNOOC Ltd": {
+      "symbol": "0883.HK",
+      "region": "HK",
+      "currency": "HKD",
+      "type": "股票",
+      "manager": null
+    },
+    "PetroChina Co Ltd": {
+      "symbol": "0857.HK",
+      "region": "HK",
+      "currency": "HKD",
+      "type": "股票",
+      "manager": null
+    },
+    "中国海洋石油有限公司": {
+      "symbol": "0883.HK",
+      "region": "HK",
+      "currency": "HKD",
+      "type": "股票",
+      "manager": null
+    },
+    "中国石油天然气股份": {
+      "symbol": "0857.HK",
+      "region": "HK",
+      "currency": "HKD",
+      "type": "股票",
+      "manager": null
+    }
+  }
+}

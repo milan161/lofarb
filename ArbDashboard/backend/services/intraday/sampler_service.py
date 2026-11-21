@@ -1,9 +1,26 @@
 import asyncio
 import logging
+import threading
+import time as _time
 from datetime import datetime
 import pandas as pd
 
 logger = logging.getLogger(__name__)
+
+# [AI-2026-11-21 东哥拍板 B] 三只原油基金走 hrv（持仓实时估值）专用链路：
+# 分母 = hsv(base_nav) × (1 + Σ wᵢ × (CL现价/CL冻结 − 1))，与 016 观察表、下单时刻估值同源。
+# 与其余基金（DynamicValuationCalculator 篮子 ETF 口径）严格分路，绝不混算。
+OIL_CODES = {'160723', '161129', '501018'}
+
+# CL 现价三档共享取价器（last / bid / ask）：
+# - 新浪 hf_CL{contract} 一次抓回三档（如 "83.660,,83.600,83.620,..."：现价/买一/卖一），
+#   一次网络 IO 同时喂给 premium(last) 与 open/close(bid/ask) 三条曲线，避免重复抓。
+# - 10s TTL 进程内缓存：3 只原油 × 每只 3 档 = 9 次取值/分钟，命中后只需 1 次真实抓取/合约。
+# - 与 H5 /oil 的 _cl_fetch_cached 同思路，但本进程（arb-sampler daemon）独立，不能跨进程复用。
+# - 抓价失败不写缓存、照常抛错 ⇒ 该轮原油基金 0 行，符合「宁缺毋假」。
+_OIL_CL_CACHE = {}                      # contract -> (monotonic_ts, (last, bid, ask, quote_time))
+_OIL_CL_CACHE_LOCK = threading.Lock()
+_OIL_CL_TTL_S = 10.0
 
 def _scalar_level(v):
     """[AI-2026-08-24] A股实时源(tdx/sina/guojin/galaxy/tencent)的bid/ask为5档list，
@@ -58,10 +75,13 @@ class IntradaySamplerService:
         #  → ... → 间接回到 sampler_service）。移至 __init__ 内，运行时所有模块已加载，
         # 不再循环；且未来即便在 main.py 重新实例化 sampler 也更稳健。
         from arbcore.calculators.dynamic_valuation import DynamicValuationCalculator
+        from services.holding_service import HoldingService
         self.db = db_manager
         self.market_data = market_data_service
         self.config_service = config_service
         self.calculator = DynamicValuationCalculator(db_manager)
+        # [AI-2026-11-21 东哥拍板 B] 原油三基金 hrv 估值器（CL 链路），与 calculator 分路并存
+        self.holding_service = HoldingService(db_manager)
         self.running = False
         self._task = None
         self.active_watchlist = []
@@ -69,9 +89,99 @@ class IntradaySamplerService:
         # 同时作为启动后订阅实时源的符号集合（独立守护进程不会自动订阅 → 缓存空 → 取价 None）。
         # [2026-11-13] 扩 2 只 XOP 跟踪 ETF：513350（富国标普石油）、159518（嘉实标普石油）；
         # 二者篮子均为 XOP 100%，XOP 实时价本就被 162411 订阅，不新增美股 ETF 订阅。
-        self.target_codes = {'162411', '164701', '161116', '513350', '159518'}
+        # [2026-11-20] 扩 161127（标普生物科技，XBI 跟踪 LOF）。
+        # [AI-2026-11-21 东哥拍板 B] 扩三只原油基金（走 hrv/CL 链路，非 ETF 篮子）：
+        # 160723 嘉实原油 / 161129 易方达原油 / 501018 南方原油，用于画实时折溢价曲线。
+        # 🔴 11-21 修订：B 方案首次改这里时漏掉 161127（只剩 8 只）⇒ 已补回，必须与
+        # arm_sync_service.ARM_SYNC_FUNDS / 前端 ARM_SYNC_FUNDS / arb_radar_router.FUNDS 一致（9 只）。
+        self.target_codes = {'162411', '164701', '161116', '513350', '159518', '161127'} | OIL_CODES
         self.lof_prices = {}   # [2026-08-21] LOF买卖一价缓存
         self.etf_prices = {}   # [2026-08-21] ETF买卖一价缓存
+
+    @staticmethod
+    def _fetch_cl_quote(contract: str):
+        """抓一次新浪 hf_CL{contract}，返回 (last, bid, ask, quote_time)；10s TTL 复用。
+
+        新浪 hf_ 期货字段：[0]现价 [2]买一 [3]卖一 [6]时间 [12]日期（见 holding_service._sina_quote_time）。
+        一次网络 IO 同时取三档 ⇒ premium 用 last、open 用 bid、close 用 ask，三条曲线同源同刻。
+        失败不写缓存、照常抛错（宁缺毋假），由调用方跳过该基金本轮。
+        """
+        from services.holding_service import HoldingService
+        now = _time.monotonic()
+        with _OIL_CL_CACHE_LOCK:
+            hit = _OIL_CL_CACHE.get(contract)
+            if hit and now - hit[0] < _OIL_CL_TTL_S:
+                return hit[1]
+        import re
+        import urllib.request
+        code = "hf_CL" + contract
+        last_err = None
+        for attempt in range(3):
+            try:
+                url = "https://hq.sinajs.cn/list=" + code
+                req = urllib.request.Request(
+                    url, headers={"Referer": "https://finance.sina.com.cn",
+                                  "User-Agent": "Mozilla/5.0"})
+                raw = urllib.request.urlopen(req, timeout=8).read().decode("gbk", "ignore")
+                m = re.search(r'var hq_str_' + code + r'="(.*?)"', raw)
+                if not m:
+                    raise ValueError(f"新浪未匹配 {code}")
+                f = [x.strip() for x in m.group(1).split(",")]
+                last, bid, ask = float(f[0]), float(f[2]), float(f[3])
+                if not (1.0 < last < 1000.0 and 1.0 < bid < 1000.0 and 1.0 < ask < 1000.0):
+                    raise ValueError(f"新浪 {code} 三档价异常: {last}/{bid}/{ask}")
+                quote_time = HoldingService._sina_quote_time(f)
+                val = (last, bid, ask, quote_time)
+                with _OIL_CL_CACHE_LOCK:
+                    _OIL_CL_CACHE[contract] = (_time.monotonic(), val)
+                return val
+            except Exception as e:
+                last_err = e
+                if attempt < 2:
+                    _time.sleep(0.3 * (attempt + 1))
+        raise ValueError(f"新浪 {code} 三档抓取失败(已重试3次): {last_err}")
+
+    def _sample_oil(self, code: str, lof_price: float, lof_bid: float, lof_ask: float):
+        """[AI-2026-11-21 东哥拍板 B] 原油基金 hrv 链路估值，返回 (rt_val, premium, open, close, bid, ask)。
+
+        口径（与 016 观察表 / 下单时刻估值同源）：
+          est(level) = hsv(base) × (1 + Σ wᵢ × (CL现价(level) / CL冻结ᵢ − 1))
+          premium     = LOF现价 / est(last) − 1
+          open_premium= LOF卖一 / est(bid)  − 1   （开仓吃卖一，CL 用买一档→估值低→溢价高，与 ETF safe 同向）
+          close_premium=LOF买一 / est(ask) − 1    （平仓吃买一，CL 用卖一档→估值高→溢价低，与 ETF peg 同向）
+        合约：跟随 get_realtime_valuation 的 selected_contract（近月，自动换月，无需人工）。
+        cl_fetcher 三档共用 _fetch_cl_quote 的 10s 缓存 ⇒ 一次真实抓取喂三条线。
+        任一档估值失败 → 返回 None，本轮该基金 0 行（宁缺毋假，不编造）。
+        """
+        hs = self.holding_service
+
+        def _fetch_with(level):
+            def _f(contract):
+                q = self._fetch_cl_quote(contract)
+                return (q[level], q[3])
+            return _f
+
+        results = {}
+        selected = None
+        for level in (0, 1, 2):  # last / bid / ask
+            r = hs.get_realtime_valuation(code, cl_fetcher=_fetch_with(level))
+            if not r or r.get('status') not in ('ok', 'partial'):
+                logger.warning(f"🛢️ {code} hrv[{level}] 基准不可用: {(r or {}).get('message')}")
+                return None
+            if selected is None:
+                selected = r.get('selected_contract')
+            c = (r.get('contracts') or {}).get(selected) or {}
+            if c.get('status') != 'ok' or not c.get('hrv') or c['hrv'] <= 0:
+                logger.warning(f"🛢️ {code} hrv[{level}] 失败: {c.get('message')}")
+                return None
+            results[level] = c['hrv']
+
+        est_last, est_bid, est_ask = results[0], results[1], results[2]
+        premium = (lof_price / est_last - 1) * 100 if lof_price > 0 else None
+        open_prem = (lof_ask / est_bid - 1) * 100 if lof_ask > 0 else None
+        close_prem = (lof_bid / est_ask - 1) * 100 if lof_bid > 0 else None
+        quote = self._fetch_cl_quote(selected)
+        return (est_last, premium, open_prem, close_prem, quote[1], quote[2])
 
     def _load_db_basket(self, fund_code: str):
         """[AI-2026-09-22 第2步断源] 读 fund_basket_weights 最新日期篮子（yaml 同构 list[dict]）。
@@ -334,19 +444,28 @@ class IntradaySamplerService:
                     price = self.lof_prices.get(code, {}).get('price', 0)
                     if price <= 0:
                         continue
-                    
-                    # 计算实时估值（传入完整符号格式的current_etfs）
-                    res = self.calculator.calculate(fund, current_fx, current_etfs)
-                    if res and res.get('rt_val') and res['rt_val'] > 0:
+
+                    lof_ask = _scalar_level(self.lof_prices.get(code, {}).get('ask', 0))
+                    lof_bid = _scalar_level(self.lof_prices.get(code, {}).get('bid', 0))
+
+                    # [AI-2026-11-21 东哥拍板 B] 原油三基金走 hrv(CL) 专用链路；其余走 ETF 篮子口径。
+                    # 两路产出统一六元组 (rt_val, premium, open, close, etf_bid, etf_ask) 共用下方 INSERT。
+                    if code in OIL_CODES:
+                        oil = self._sample_oil(code, price, lof_bid, lof_ask)
+                        if oil is None:
+                            continue
+                        rt_val, premium, open_premium, close_premium, etf_bid, etf_ask = oil
+                    else:
+                        # 计算实时估值（传入完整符号格式的current_etfs）
+                        res = self.calculator.calculate(fund, current_fx, current_etfs)
+                        if not (res and res.get('rt_val') and res['rt_val'] > 0):
+                            continue
                         rt_val = res['rt_val']
                         premium = (price / rt_val - 1) * 100
 
                         # [2026-08-21] 计算真实开仓/平仓溢价率
                         # open_premium = (LOF_ask1 / backendRtValSafe - 1) * 100  # 买LOF吃卖一
                         # close_premium = (LOF_bid1 / backendRtValPeg - 1) * 100   # 卖LOF吃买一
-                        lof_ask = _scalar_level(self.lof_prices.get(code, {}).get('ask', 0))
-                        lof_bid = _scalar_level(self.lof_prices.get(code, {}).get('bid', 0))
-
                         # backendRtValSafe: 用ETF买一价（bid）计算
                         #   开仓时卖空ETF吃买一（低价），成本保守→估值偏低→溢价偏高
                         # backendRtValPeg: 用ETF卖一价（ask）计算
@@ -381,15 +500,15 @@ class IntradaySamplerService:
                         if lof_bid > 0 and backend_rt_val_peg > 0:
                             close_premium = (lof_bid / backend_rt_val_peg - 1) * 100
 
-                        cursor.execute("""
-                            INSERT INTO fund_intraday_quotes
-                            (fund_code, date, time, price, rt_val, premium, open_premium, close_premium,
-                             lof_bid1, lof_ask1, etf_bid1, etf_ask1)
-                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        """, (code, date_str, time_str, price, rt_val, premium,
-                              open_premium, close_premium,
-                              lof_bid, lof_ask, etf_bid, etf_ask))
-                        written += 1
+                    cursor.execute("""
+                        INSERT INTO fund_intraday_quotes
+                        (fund_code, date, time, price, rt_val, premium, open_premium, close_premium,
+                         lof_bid1, lof_ask1, etf_bid1, etf_ask1)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """, (code, date_str, time_str, price, rt_val, premium,
+                          open_premium, close_premium,
+                          lof_bid, lof_ask, etf_bid, etf_ask))
+                    written += 1
                 conn.commit()
                 # [A-守卫] 整轮写库守卫：有基金要采却 0 行 → 取价/估值全断，盲窗！
                 if len(funds_to_sample) > 0 and written == 0:

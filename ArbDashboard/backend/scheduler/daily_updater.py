@@ -2935,23 +2935,38 @@ class DailyUpdater(BaseApp):
         self.logger.info("🎉 流水线执行完毕，数据大盘一切就绪！")
 
     def _weekend_vps_pull_only(self):
-        """[AI-2026-10-12 东哥拍板] 非交易日（周六为主）轻量补拉 step5b+step5c，不跑完整流水线。
+        """[AI-2026-10-12 东哥拍板 / 2026-11-21 根修] 非交易日轻量补拉 step5+5b+5c+静态重算。
 
-        动机：VPS crontab 每天跑（`* * *`，docs/002_1:46），周五美股数据必须**周六清晨**收。
-        此前门控直接 return，周六从未拉 VPS → XOP 等 QDII 周五净值一直缺到下周一。
+        动机：VPS crontab 每天跑（`* * *`，docs/002_1:46），周五美股收盘价必须**周六清晨**才落
+        `usa_prices_{date}.json`。此前门控直接 return，周六从未拉 VPS → QDII 净值缺到下周一；
+        10-12 改为轻量补拉后，函数体只实现 step5b+step5c，**漏了 step5**（美股/指数日线）——
+        门控 :2826 的注释本就写着「step5+5b+5c+静态重算」，实现与注释不符。
+        2026-11-21 实证：VPS 07:02 已产 11-21 文件，本机/ARM 都没拉 ⇒ USO/OILK/BNO 缺 11-20、
+        OILK 缺 11-19，三原油 hsv 被「宁缺毋假」拦掉。本次让实现与注释对齐。
 
         due 判定（_try_sync_all_from_vps 内部按 file_date 幂等）：
-          - step5c etf_nav：昨日=周五美交易日 → 周六 due，补拉周五净值 ✓
-          - step5b index：周六非日/欧交易日 → 不 due（no-op），但周五欧/日指数仍会补到 ✓
+          - step5 usa_prices：昨日=周五美交易日 → 周六 due，补拉周五收盘价 ✓
+          - step5c etf_nav：同上，补拉周五净值 ✓
+          - step5b index：周六非日/欧交易日 → 多为 no-op，但周五欧/日指数仍会补到 ✓
+        静态重算口径与清晨刷新分支一致：ARM 自算（权威）落库；本机只从 ARM 拉回，不在本机算。
         每步独立 try/except，单步失败（VPS 不可达等）不中断；重复跑安全（幂等）。
         """
-        self.logger.info("🛰️ [周末轻量补拉] step5b(指数) + step5c(ETF净值)...")
-        for name, fn in (("step5b", self.step5b_sync_vps_index_data),
+        self.logger.info("🛰️ [周末轻量补拉] step5(美股/指数) + step5b(指数) + step5c(ETF净值) + 静态重算...")
+        for name, fn in (("step5", lambda: self.step5_fetch_usa_market_data(weekend_mode=True)),
+                         ("step5b", self.step5b_sync_vps_index_data),
                          ("step5c", self.step5c_sync_vps_etf_nav)):
             try:
                 fn()
             except Exception as _e:
                 self.logger.warning(f"⚠️ [周末轻量补拉] {name} 失败（不中断）: {_e}")
+        # [2026-11-21 根修] 静态重算：与 refresh_morning 分支同口径（ARM 自算为权威，本机不算）
+        try:
+            if _is_arm_runtime():
+                self._step_oil_recalc()
+            else:
+                self.step13_oil_data_sync()
+        except Exception as _e:
+            self.logger.warning(f"⚠️ [周末轻量补拉] 静态重算/同步失败（不中断）: {_e}")
         self.logger.info("🎉 [周末轻量补拉] 完成")
 
     def step13_oil_data_sync(self):

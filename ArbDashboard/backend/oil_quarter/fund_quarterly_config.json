@@ -1,0 +1,33 @@
+{
+  "_description": "原油三只 LOF 基金（501018南方/160723嘉实/161129易方达）季报 PDF 抓取配置",
+  "funds": [
+    {
+      "fund_code": "160723",
+      "fund_name": "嘉实原油",
+      "url_source": "eastmoney_jjgg",
+      "jjgg_url_template": "https://fundf10.eastmoney.com/jjgg_160723_3.html",
+      "announc_search_keywords": ["嘉实原油"],
+      "notes": "季报PDF格式：https://pdf.dfcfw.com/pdf/H2_{ANID}_1.pdf；已通过验证下载正常"
+    },
+    {
+      "fund_code": "501018",
+      "fund_name": "南方原油",
+      "url_source": "eastmoney_jjgg",
+      "jjgg_url_template": "https://fundf10.eastmoney.com/jjgg_501018_3.html",
+      "announc_search_keywords": ["南方原油"],
+      "notes": "同上，已通过验证"
+    },
+    {
+      "fund_code": "161129",
+      "fund_name": "易方达原油",
+      "url_source": "eastmoney_jjgg",
+      "jjgg_url_template": "https://fundf10.eastmoney.com/jjgg_161129_3.html",
+      "announc_search_keywords": ["易方达原油"],
+      "notes": "新加入，需首次获取Q3报告AN ID后下载验证"
+    }
+  ],
+  "pdf_base_url": "https://pdf.dfcfw.com/pdf/H2_",
+  "pdf_suffix": "_1.pdf",
+  "download_dir": "_tmp/jsfund_{code}",
+  "report_type_map": {"季度报告": "Q1,Q2,Q3,Q4", "半年度报告": "H1,H2", "年度报告": "A1"}
+}

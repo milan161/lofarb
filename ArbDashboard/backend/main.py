@@ -1212,12 +1212,26 @@ try:
         out["futures"] = mx("SELECT MAX(date) FROM futures_daily")
         out["fund_factors"] = mx("SELECT MAX(date) FROM fund_daily_factors")
         out["index_hist"] = mx("SELECT MAX(date) FROM index_history")
-        # [2026-11-10 东哥拍板] 补 4 类此前漏报的源：
-        #   oil7       = 三原油基金持仓估值所需的 7 只底层 ETF/ETC 单标的，取「最差(最旧/缺失)」最新日；
-        #               任一缺失 → COALESCE 落 '0000-00-00' → 整行报缺失（避免被 VPS 的 USO/SPY 掩盖）。
-        # [2026-11-10] oil7 = 三原油底层 7 只「最差(最旧/缺失)」最新日；任一缺失 → '0000-00-00'。
+        # [2026-11-10 东哥拍板 / 2026-11-21 修正] 补 oil7 源；键名不变（前端契约），名单改为真实季报篮子：
+        #   oil7 = 三原油基金季报篮子各标的最新日的最小值；任一缺失 → '0000-00-00' → 整行报缺失。
+        #   旧硬编码 {CRUD,BRNT,03175,SLV,OILUSA,1671,1699} 抄自 ARM sampler 的「VPS 未覆盖 7 只」，
+        #   混入白银 SLV（属 164701 汇添富贵金属 / 160216 国泰大宗商品，不在任何原油基金持仓），
+        #   却漏掉真正的持仓腿 USO/OILK/BNO/DBO ⇒ 红灯误报 + 真实缺口漏报（11-21 实证）。
+        #   临时锁 2026Q2（东哥 11-21 定；Q3 数据另路在补，入库后只改 _OIL_PERIOD 一处即可）。
+        _OIL_PERIOD = "2026Q2"
+        _OIL_ALIAS = {"BRNG": "BRNT", "BNQA": "BRNT"}  # 币种份额按 BRNT USD 价折算（同 holding_service）
+        try:
+            cur.execute("SELECT DISTINCT symbol FROM fund_report_holdings "
+                        "WHERE fund_code IN ('160723','161129','501018') AND report_period=? "
+                        "AND symbol IS NOT NULL", (_OIL_PERIOD,))
+            _oil_syms = sorted({_OIL_ALIAS.get(str(r[0]).strip(), str(r[0]).strip())
+                                for r in cur.fetchall() if r[0]})
+        except Exception:
+            _oil_syms = []
+        if not _oil_syms:
+            _oil_syms = ["CRUD", "BRNT", "USO", "OILK", "BNO", "DBO"]
+        out["oil7_symbols"] = _oil_syms
         # 用 Python 侧 min（不依赖 VALUES 相关子查询，ARM 旧版 sqlite 执行该 SQL 会静默异常返回 None）
-        _oil_syms = ["CRUD", "BRNT", "03175", "SLV", "OILUSA", "1671", "1699"]
         _oil_maxes = [mx("SELECT MAX(date) FROM usa_etf_daily_prices WHERE symbol='%s'" % s) for s in _oil_syms]
         out["oil7"] = min([m if m else "0000-00-00" for m in _oil_maxes])
         out["cl_freeze"] = mx("SELECT MAX(trade_date) FROM futures_freeze_prices")
@@ -1301,12 +1315,26 @@ def _build_freshness_report(db_path: str) -> dict:
         out["futures"] = mx("SELECT MAX(date) FROM futures_daily")
         out["fund_factors"] = mx("SELECT MAX(date) FROM fund_daily_factors")
         out["index_hist"] = mx("SELECT MAX(date) FROM index_history")
-        # [2026-11-10 东哥拍板] 补 4 类此前漏报的源：
-        #   oil7       = 三原油基金持仓估值所需的 7 只底层 ETF/ETC 单标的，取「最差(最旧/缺失)」最新日；
-        #               任一缺失 → COALESCE 落 '0000-00-00' → 整行报缺失（避免被 VPS 的 USO/SPY 掩盖）。
-        # [2026-11-10] oil7 = 三原油底层 7 只「最差(最旧/缺失)」最新日；任一缺失 → '0000-00-00'。
+        # [2026-11-10 东哥拍板 / 2026-11-21 修正] 补 oil7 源；键名不变（前端契约），名单改为真实季报篮子：
+        #   oil7 = 三原油基金季报篮子各标的最新日的最小值；任一缺失 → '0000-00-00' → 整行报缺失。
+        #   旧硬编码 {CRUD,BRNT,03175,SLV,OILUSA,1671,1699} 抄自 ARM sampler 的「VPS 未覆盖 7 只」，
+        #   混入白银 SLV（属 164701 汇添富贵金属 / 160216 国泰大宗商品，不在任何原油基金持仓），
+        #   却漏掉真正的持仓腿 USO/OILK/BNO/DBO ⇒ 红灯误报 + 真实缺口漏报（11-21 实证）。
+        #   临时锁 2026Q2（东哥 11-21 定；Q3 数据另路在补，入库后只改 _OIL_PERIOD 一处即可）。
+        _OIL_PERIOD = "2026Q2"
+        _OIL_ALIAS = {"BRNG": "BRNT", "BNQA": "BRNT"}  # 币种份额按 BRNT USD 价折算（同 holding_service）
+        try:
+            cur.execute("SELECT DISTINCT symbol FROM fund_report_holdings "
+                        "WHERE fund_code IN ('160723','161129','501018') AND report_period=? "
+                        "AND symbol IS NOT NULL", (_OIL_PERIOD,))
+            _oil_syms = sorted({_OIL_ALIAS.get(str(r[0]).strip(), str(r[0]).strip())
+                                for r in cur.fetchall() if r[0]})
+        except Exception:
+            _oil_syms = []
+        if not _oil_syms:
+            _oil_syms = ["CRUD", "BRNT", "USO", "OILK", "BNO", "DBO"]
+        out["oil7_symbols"] = _oil_syms
         # 用 Python 侧 min（不依赖 VALUES 相关子查询，ARM 旧版 sqlite 执行该 SQL 会静默异常返回 None）
-        _oil_syms = ["CRUD", "BRNT", "03175", "SLV", "OILUSA", "1671", "1699"]
         _oil_maxes = [mx("SELECT MAX(date) FROM usa_etf_daily_prices WHERE symbol='%s'" % s) for s in _oil_syms]
         out["oil7"] = min([m if m else "0000-00-00" for m in _oil_maxes])
         out["cl_freeze"] = mx("SELECT MAX(trade_date) FROM futures_freeze_prices")
@@ -2042,6 +2070,89 @@ async def refetch_oil_prices():
         return {"status": "ok" if ok else "error", "data": data}
     except Exception as e:
         logger.error(f"重抓美股价并推 ARM 失败: {e}")
+        return {"status": "error", "message": str(e)}
+
+
+# ── 原油季报持仓「季报更新」一键闭环（前端 HoldingAnalysis 季报仓位跟踪弹窗按钮调用）──
+# 复用生产管道 backend/oil_quarter/fetch_fund_quarterly.py：检测最新未入库季报 →
+# curl 下载 PDF → pdfplumber 解析 → 写本地 fund_report_holdings → 推 ARM → 驱动 ARM 重算 hsv → 拉回本地。
+# 新标的未映射(symbol=null) 时管道会中止入库并返回待补名称，需人工补 holding_symbol_map.json 后重试。
+def _load_oil_quarter_module():
+    """把 oil_quarter 目录加入 sys.path 并返回 fetch_fund_quarterly 模块。"""
+    oq_dir = os.path.join(backend_dir, "oil_quarter")
+    if oq_dir not in sys.path:
+        sys.path.insert(0, oq_dir)
+    import fetch_fund_quarterly as F
+    return F
+
+
+@app.post("/api/oil_quarter/refresh")
+async def oil_quarter_refresh(code: str):
+    """[AI-2026-11-21 东哥需求] 季报更新一键闭环（仅本机执行）。
+
+    只取「比库内最新期更新」的未入库季报（不回补 2025 等历史期）。
+    入库成功后自动推 ARM + 驱动 ARM 重算 holding_static_val + 拉回本地缓存，
+    等价于 refetch_oil_prices 的闭环，只是数据源换成季报持仓。
+    """
+    if _is_arm():
+        return {"status": "error", "message": "该操作仅在本机执行"}
+    try:
+        def _job():
+            F = _load_oil_quarter_module()
+            config = F.load_config()
+            db = F.DB_PATH_ENV
+
+            # ① 只找比库内最新期更新的未入库季报
+            in_db = F.get_reported_periods_from_db(code, db)
+            latest_in_db = max(in_db) if in_db else ""
+            target = None
+            for ann in F.detect_announcements(code):
+                period = F.parse_period_from_title(ann["title"])
+                if not period or period <= latest_in_db:
+                    continue
+                target = {"period": period, "an_id": ann["an_id"], "pub_date": ann["date"]}
+                break  # JJGG 按日期倒序，第一个即最新
+            if not target:
+                return {"status": "up_to_date", "period": latest_in_db,
+                        "message": f"已是最新（{latest_in_db or '无'}），暂无更新季报"}
+
+            # ② 下载 + 解析 + 写本地（管道内含 symbol=null 断言 + 半自动补映射，
+            #    真·新品种无法补全时才中止并回传 unmapped）
+            res = F.process_fund(config, code, an_id=target["an_id"], period=target["period"],
+                                 db_path=db, dry_run=False, no_arm_sync=True)
+            if res.get("status") != "ok" or res.get("skipped"):
+                res["period"] = res.get("period", target["period"])
+                return res  # error / need_pdf / warn 原样回传（含 unmapped / auto_resolved）
+
+            # ③ 推 ARM（fund_report_holdings）
+            F.sync_to_arm([code], db)
+
+            # ④ 驱动 ARM 自算 holding_static_val（现算并落 ARM 库）
+            recalc = _arm_api_via_ssh(
+                "GET", f"/api/fund/{code}/holding-recalc-detail",
+                query={"start": target["period"][:4] + "-01-01"}, timeout=600)
+
+            # ⑤ ARM 自算值拉回本地缓存（页面读本地 holding_static_val）
+            pull = holding_service.pull_oil_static_from_arm()
+
+            n_auto = len(res.get("auto_resolved") or [])
+            msg = f"{code} {target['period']} 已入库并同步静态持仓估值"
+            if n_auto:
+                msg += f"（半自动补映射 {n_auto} 条）"
+            return {"status": "ok", "period": target["period"], "count": res.get("count"),
+                    "total_weight_pct": res.get("total_weight_pct"),
+                    "auto_resolved": res.get("auto_resolved") or [],
+                    "recalc_status": (recalc or {}).get("status"),
+                    "pull_status": (pull or {}).get("status"),
+                    "message": msg}
+
+        loop = asyncio.get_event_loop()
+        data = await loop.run_in_executor(None, _job)
+        ok = data.get("status") in ("ok", "up_to_date")
+        return {"status": "ok" if ok else "error", "data": data}
+    except Exception as e:
+        import traceback
+        logger.error(f"oil_quarter_refresh {code} failed: {e}\n{traceback.format_exc()}")
         return {"status": "error", "message": str(e)}
 
 

@@ -754,6 +754,37 @@ def _in_day_session_window() -> bool:
     return _now.weekday() < 5 and (9, 0) <= (_now.hour, _now.minute) < (15, 0)
 
 
+def _futures_row_stale(row_date, max_trading_days: int = 3) -> bool:
+    """futures_daily 回退行是否过期：距今超过 max_trading_days 个 A 股交易日 → True（拒绝使用）。
+
+    [AI-2026-11-21] 根因护栏：非交易日回退曾无上限，把 4+ 交易日前的旧行当最新
+    （AG0 断供 11-17~11-20 时，11-16 行被除以实时昨结算 → +15% 荒谬涨幅）。
+    现超过 3 个交易日子宁留空（与 health_monitor lag=1 告警互补：告警修数据，这里止血展示）。
+    """
+    try:
+        row_d = datetime.strptime(str(row_date)[:10], '%Y-%m-%d').date()
+    except Exception:
+        return True
+    today = datetime.now().date()
+    if row_d >= today:
+        return False
+    n = 0
+    d = row_d
+    while d < today:
+        d += timedelta(days=1)
+        try:
+            from arbcore.utils.market_calendar import is_trading_day as _td
+            if _td('A_SHARE', d):
+                n += 1
+                if n > max_trading_days:
+                    return True
+        except Exception:
+            # 日历不可用时退化为自然日：>10 自然日视作过期
+            if (today - row_d).days > 10:
+                return True
+    return False
+
+
 def _get_futures_official_price(conn, symbol: str, today: str, column: str = 'close_price'):
     """期货当日官方价：column='close_price' 官方收盘价 / 'settle_price' 当日结算价（白名单外返回 None）。
     当日无行且今日非交易日（周末/节假日）→ 回退最近一个已收盘交易日（最新一行 ≤ 今日），
@@ -769,9 +800,11 @@ def _get_futures_official_price(conn, symbol: str, today: str, column: str = 'cl
             from arbcore.utils.market_calendar import is_trading_day as _cal_td
             if not _cal_td('A_SHARE', datetime.now().date()):
                 row = conn.execute(
-                    f"SELECT {column} FROM futures_daily WHERE symbol=? AND date<=? AND {column}>0 "
+                    f"SELECT {column}, date FROM futures_daily WHERE symbol=? AND date<=? AND {column}>0 "
                     "ORDER BY date DESC LIMIT 1", (symbol, today)
                 ).fetchone()
+                if row and _futures_row_stale(row[1]):
+                    row = None  # 过期行拒绝顶替（宁缺毋假）
         return float(row[0]) if row and row[0] else None
     except Exception:
         return None
@@ -2155,18 +2188,39 @@ class FundService:
                                         from arbcore.utils.market_calendar import is_trading_day as _cal_td
                                         if not _cal_td('A_SHARE', datetime.now().date()):
                                             _rd = _conn_c.execute(
-                                                "SELECT close_price, settle_price FROM futures_daily "
+                                                "SELECT close_price, settle_price, date FROM futures_daily "
                                                 "WHERE symbol='AG0' AND date<=? AND close_price>0 "
                                                 "AND settle_price>0 ORDER BY date DESC LIMIT 1", (_today,)
                                             ).fetchone()
+                                            if _rd and _futures_row_stale(_rd[2]):
+                                                _rd = None  # [AI-2026-11-21] >3交易日旧行拒绝顶替
                                     # 盘后官方收盘口径：rt_val 分子=官方收盘、static_val 分子=官方结算
                                     if _rd:
                                         _close, _settle = float(_rd[0]), float(_rd[1])
-                                        _rt = nav_home * (_close / settlement_price)
+                                        # [AI-2026-11-21] 分母校正：新浪「昨结算」在休市日会滚动到
+                                        # 回退行同日 settle（周六 parts[10]=周五 settle），与分子同日
+                                        # → 比值恒 1、static_val 退化为 NAV。改为取回退行 date 的
+                                        # 上一交易日结算价做分母（= 公式本义 settle(D)/settle(D-1)）。
+                                        _denom = settlement_price
+                                        try:
+                                            from arbcore.utils.market_calendar import get_previous_trading_day as _gptd
+                                            from datetime import date as _date_cls
+                                            _rd_d = _date_cls.fromisoformat(str(_rd[2])[:10])
+                                            _prev_rd = _gptd(_rd_d).strftime('%Y-%m-%d')
+                                            _pr = _conn_c.execute(
+                                                "SELECT settle_price FROM futures_daily "
+                                                "WHERE symbol='AG0' AND date=? AND settle_price>0",
+                                                (_prev_rd,)
+                                            ).fetchone()
+                                            if _pr and float(_pr[0]) > 0:
+                                                _denom = float(_pr[0])
+                                        except Exception:
+                                            pass  # 取不到则维持 settlement_price
+                                        _rt = nav_home * (_close / _denom)
                                         metrics['rt_val'] = round(_rt, 4)
                                         if metrics.get('price', 0) > 0:
                                             metrics['rt_premium'] = round((metrics['price'] / _rt - 1) * 100, 3)
-                                        metrics['static_val'] = round(nav_home * (_settle / settlement_price), 4)
+                                        metrics['static_val'] = round(nav_home * (_settle / _denom), 4)
                                         # [AI-2026-10-11 东哥口径] 「实时成交价」列收盘后显示"实盘价"（官方收盘）
                                         metrics['ag0_price'] = _close
                                         metrics['ag0_close'] = _close
@@ -2340,18 +2394,36 @@ class FundService:
                                         from arbcore.utils.market_calendar import is_trading_day as _cal_td
                                         if not _cal_td('A_SHARE', datetime.now().date()):
                                             _rdm = _conn_m.execute(
-                                                "SELECT close_price, settle_price FROM futures_daily "
+                                                "SELECT close_price, settle_price, date FROM futures_daily "
                                                 "WHERE symbol='M0' AND date<=? AND close_price>0 "
                                                 "AND settle_price>0 ORDER BY date DESC LIMIT 1", (_today,)
                                             ).fetchone()
+                                            if _rdm and _futures_row_stale(_rdm[2]):
+                                                _rdm = None  # [AI-2026-11-21] >3交易日旧行拒绝顶替
                                     # 盘后官方收盘口径：rt_val 分子=官方收盘、static_val 分子=官方结算
                                     if _rdm:
                                         _m_close, _m_settle = float(_rdm[0]), float(_rdm[1])
-                                        _rt_m = nav_home * (_m_close / m_settlement)
+                                        # [AI-2026-11-21] 与 AG0 对称：分母用回退行上一交易日结算价
+                                        _denom_m = m_settlement
+                                        try:
+                                            from arbcore.utils.market_calendar import get_previous_trading_day as _gptd
+                                            from datetime import date as _date_cls
+                                            _rdm_d = _date_cls.fromisoformat(str(_rdm[2])[:10])
+                                            _prev_rdm = _gptd(_rdm_d).strftime('%Y-%m-%d')
+                                            _prm = _conn_m.execute(
+                                                "SELECT settle_price FROM futures_daily "
+                                                "WHERE symbol='M0' AND date=? AND settle_price>0",
+                                                (_prev_rdm,)
+                                            ).fetchone()
+                                            if _prm and float(_prm[0]) > 0:
+                                                _denom_m = float(_prm[0])
+                                        except Exception:
+                                            pass
+                                        _rt_m = nav_home * (_m_close / _denom_m)
                                         metrics['rt_val'] = round(_rt_m, 4)
                                         if metrics.get('price', 0) > 0:
                                             metrics['rt_premium'] = round((metrics['price'] / _rt_m - 1) * 100, 3)
-                                        metrics['static_val'] = round(nav_home * (_m_settle / m_settlement), 4)
+                                        metrics['static_val'] = round(nav_home * (_m_settle / _denom_m), 4)
                                         # [AI-2026-10-11 东哥口径] 「实时成交价」列收盘后显示"实盘价"（官方收盘）
                                         metrics['m0_price'] = _m_close
                                         metrics['m0_close'] = _m_close

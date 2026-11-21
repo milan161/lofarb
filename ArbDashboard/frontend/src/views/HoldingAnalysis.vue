@@ -273,9 +273,25 @@
     <n-modal
       v-model:show="trackingModalShow"
       preset="card"
-      :title="fundCode + ' 季报仓位跟踪'"
       style="width: 1000px; max-width: 94vw;"
     >
+      <template #header>
+        <div style="display: flex; align-items: center; gap: 12px; flex-wrap: wrap;">
+          <span style="font-size: 16px; font-weight: 600;">{{ fundCode }} 季报仓位跟踪</span>
+          <n-tooltip trigger="hover" placement="bottom-start">
+            <template #trigger>
+              <n-button size="small" type="primary" :loading="quarterlyLoading" @click="onQuarterlyRefresh">
+                季报更新
+              </n-button>
+            </template>
+            到季度出季报时点此：自动检测最新未入库季报 → 下载解析入库 → 推 ARM → 重算并同步静态持仓估值。若出现新标的(symbol=null)会提示补充 holding_symbol_map.json 后重试。
+          </n-tooltip>
+          <span
+            v-if="quarterlyMsg"
+            :style="{ fontSize: '12px', color: quarterlyMsg.startsWith('✅') ? '#16a34a' : (quarterlyMsg.startsWith('⚠️') ? '#d97706' : (quarterlyMsg.startsWith('ℹ️') ? '#64748b' : '#dc2626')) }"
+          >{{ quarterlyMsg }}</span>
+        </div>
+      </template>
       <n-card size="small" class="shadow-soft" style="margin-bottom: 16px;">
         <template #header>
           <div style="display: flex; align-items: center; justify-content: space-between; gap: 12px;">
@@ -584,7 +600,7 @@ import {
 } from 'naive-ui'
 import type { DataTableColumns } from 'naive-ui'
 import { PieChart } from 'lucide-vue-next'
-import { getFundHoldingPeriods, getFundHoldings, getFundHoldingRealtime, getFundHedgeExposure, getFundPenetration, getFundHoldingRecalc, getFundHoldingRecalcDetail, syncOilStatic, syncFuturesFreeze, getOilPriceFreshness, refetchOilPrices } from '../api'
+import { getFundHoldingPeriods, getFundHoldings, getFundHoldingRealtime, getFundHedgeExposure, getFundPenetration, getFundHoldingRecalc, getFundHoldingRecalcDetail, syncOilStatic, syncFuturesFreeze, getOilPriceFreshness, refetchOilPrices, refreshQuarterly } from '../api'
 import { formatPercent, priceColor } from '../utils'
 
 const route = useRoute()
@@ -677,6 +693,9 @@ const staticSynced = computed(() => recalcRows.value.length > 0)
 const staticLatestDate = computed(() => recalcRows.value.length ? recalcRows.value[0].date : '')
 const staticSyncLoading = ref(false)
 const staticSyncMsg = ref('')
+// [AI-2026-11-21 东哥需求] 季报更新按钮（季报仓位跟踪弹窗标题行）
+const quarterlyLoading = ref(false)
+const quarterlyMsg = ref('')
 
 // [AI-2026-09-23 B方案] 持仓静态估值弹窗诊断：本地核心行（recalcRows）只含 date/nav/hsv/err，
 // 诊断细节（etf_prices/fill_warning/note 等）由弹窗打开时按需从 ARM 取全量，按 date 合并后展示。
@@ -745,6 +764,36 @@ const syncStaticValuation = async () => {
     staticSyncMsg.value = `❌ 同步失败: ${e?.message || e}`
   } finally {
     staticSyncLoading.value = false
+  }
+}
+
+// [AI-2026-11-21 东哥需求] 季报更新：检测最新未入库季报 → 下载解析入库 → 推ARM → 重算hsv → 拉回；成功后刷新报告期
+const onQuarterlyRefresh = async () => {
+  quarterlyLoading.value = true
+  quarterlyMsg.value = ''
+  try {
+    const r = await refreshQuarterly(fundCode.value)
+    const d = r?.data?.data || {}
+    const st = r?.data?.status
+    if (st === 'ok' && d.status === 'up_to_date') {
+      quarterlyMsg.value = `ℹ️ ${d.message || '已是最新，暂无更新季报'}`
+    } else if (st === 'ok' && d.status === 'ok') {
+      quarterlyMsg.value = `✅ ${d.message || '季报已更新'}`
+      await loadPeriods()
+      if (d.period && periods.value.some((p: any) => p.period === d.period)) {
+        currentPeriod.value = d.period
+      }
+      await loadData()
+    } else {
+      const unmapped = d.unmapped || []
+      quarterlyMsg.value = unmapped.length
+        ? `⚠️ 以下季报名称在 holding_symbol_map.json 无映射(symbol=null)，请补充后重试：${unmapped.join('、')}`
+        : `❌ ${d.message || '季报更新失败'}`
+    }
+  } catch (e: any) {
+    quarterlyMsg.value = `❌ 季报更新失败: ${e?.message || e}`
+  } finally {
+    quarterlyLoading.value = false
   }
 }
 

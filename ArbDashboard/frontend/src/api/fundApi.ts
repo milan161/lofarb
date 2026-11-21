@@ -101,6 +101,11 @@ export function refetchOilPrices() {
   return client.post(`/api/fund/oil-refetch-prices`)
 }
 
+// [AI-2026-11-21 东哥需求] 季报更新一键闭环：检测最新未入库季报 → 下载解析入库 → 推 ARM → 重算 hsv → 拉回
+export function refreshQuarterly(code: string) {
+  return client.post(`/api/oil_quarter/refresh?code=${code}`)
+}
+
 /** 市场概览（汇率、活跃数据源、统计） */
 export function getMarketOverview() {
   return client.get('/api/market/overview')
